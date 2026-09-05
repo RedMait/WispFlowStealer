@@ -40,16 +40,49 @@ fn model_instance() -> Result<&'static Model, String> {
 
 /// Load the heavy models in the background at startup so the first hotkey
 /// press starts recording immediately instead of hanging on model load.
+/// Backend chain: Groq Cloud (needs `GROQ_API_KEY`) -> resident local
+/// whisper-server -> Vosk fallback; narrowed by the GUI/backend preference.
 pub fn preload() {
     std::thread::spawn(|| {
-        match model_instance() {
-            Ok(_) => println!("[ready] speech model loaded"),
-            Err(e) => eprintln!("[error] {e}"),
+        let pref = pref();
+        if pref.allows_groq() && crate::groq::available() {
+            println!("[ready] groq backend (cloud whisper)");
+            set_label("groq cloud");
+        } else if pref.allows_local() && crate::whisper::available() {
+            match crate::whisper::ensure_server() {
+                Ok(p) => {
+                    println!("[ready] whisper server on 127.0.0.1:{p}");
+                    set_label("whisper local");
+                }
+                Err(e) => eprintln!("[whisper] {e} (vosk fallback)"),
+            }
+        } else if pref.allows_vosk() && model_instance().is_ok() {
+            println!("[ready] speech model loaded (vosk fallback)");
+            set_label("vosk");
+        } else {
+            eprintln!("[audio] no speech backend: set GROQ_API_KEY or run scripts/get-native.ps1");
         }
         if punct_instance().is_some() {
             println!("[ready] punctuation model loaded");
         }
     });
+}
+
+/// Active backend preference: GUI setting when attached, else
+/// `FLOWVOICE_BACKEND` env, else auto.
+fn pref() -> crate::state::BackendPref {
+    if let Some(s) = crate::state::get() {
+        if let Ok(p) = s.backend_pref.lock() {
+            return *p;
+        }
+    }
+    crate::state::BackendPref::from_env().unwrap_or(crate::state::BackendPref::Auto)
+}
+
+fn set_label(label: &str) {
+    if let Some(s) = crate::state::get() {
+        s.set_backend_label(label);
+    }
 }
 
 /// Directory holding the RUPunct punctuation model, or `None` when absent.
@@ -95,15 +128,47 @@ fn finalize(text: String) -> String {
     flowcore::format(&text, lang)
 }
 
-/// Capture until the hotkey is released, recognize, return the transcript.
-/// The Vosk model is cached (see [`preload`]), so this starts recording
-/// immediately on every press after the first.
+/// Capture until the hotkey is released, recognize, return final text.
+///
+/// The microphone opens first so no speech is lost; the Vosk model is
+/// cached (see [`preload`]), and Whisper runs through a resident server,
+/// so neither backend reloads gigabytes per press.
+///
+/// Post-processing depends on the backend: Whisper (local or Groq Cloud)
+/// already restores punctuation and casing, so it only needs filler
+/// cleanup + heuristic commas ([`flowcore::format`]); Vosk outputs bare
+/// words and goes through the full [`finalize`] pipeline (neural
+/// punctuation for RU when present).
 pub fn transcribe() -> Result<String, String> {
-    let model = model_instance()?;
-
     let (pcm, rate) = capture_until_stop()?;
     let pcm16k = resample_to_16k(&pcm, rate);
+    let pref = pref();
 
+    if pref.allows_groq() && crate::groq::available() {
+        let raw = crate::groq::transcribe_pcm(&pcm16k)?;
+        set_label("groq cloud");
+        let lang = Language::detect(&raw);
+        return Ok(flowcore::format(&raw, lang));
+    }
+
+    if pref.allows_local() && crate::whisper::available() {
+        let raw = crate::whisper::transcribe_pcm(&pcm16k)?;
+        set_label("whisper local");
+        let lang = Language::detect(&raw);
+        return Ok(flowcore::format(&raw, lang));
+    }
+
+    if pref.allows_vosk() {
+        let model = model_instance()?;
+        set_label("vosk");
+        return Ok(finalize(recognize_with(model, &pcm16k)?));
+    }
+
+    Err("no speech backend enabled: set GROQ_API_KEY or run scripts/get-native.ps1".to_string())
+}
+
+/// Run the cached Vosk model over buffered audio, return the raw transcript.
+fn recognize_with(model: &Model, pcm16k: &[i16]) -> Result<String, String> {
     let mut recognizer = Recognizer::new(model, TARGET_SAMPLE_RATE as f32)
         .ok_or_else(|| "cannot create vosk recognizer".to_string())?;
 
@@ -112,7 +177,7 @@ pub fn transcribe() -> Result<String, String> {
     }
 
     let completed = recognizer.final_result();
-    Ok(finalize(transcript(&completed)))
+    Ok(transcript(&completed))
 }
 
 fn transcript(result: &CompleteResult<'_>) -> String {

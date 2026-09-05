@@ -31,10 +31,11 @@ hold Right Ctrl  ->  speak  ->  release  ->  "эм я тут подумал чт
   no network, no Python. E.g. *шестьдесят тысяч тенге сколько будет стоить*
   becomes *Шестьдесят тысяч тенге, сколько будет стоить?* When the model files
   are absent, Russian falls back to the heuristic pipeline.
-- **Fully offline** speech recognition with [Vosk](https://alphacephei.com/vosk/).
-  Russian uses the **full** model `vosk-model-ru-0.42` (~1.8 GB, WER 4.5) —
-  the old small model (`small-ru-0.22`, WER 22.71) recognized poorly. English
-  uses the small model (~40 MB).
+- **Fully offline** speech recognition with [Whisper](https://github.com/ggml-org/whisper.cpp)
+  (`large-v3-turbo`, ~1.5 GB) served by a resident local `whisper-server` —
+  far bigger Russian vocabulary than Vosk, with punctuation and casing out
+  of the box. Vosk stays as an automatic fallback when the Whisper files
+  are absent (full RU model `vosk-model-ru-0.42` / small EN model).
 - **Hermetic default build**: `cargo build`/`cargo test` compile everywhere with
   no audio/native dependencies; the mic mode (+ neural punctuation) is behind
   the `audio` feature.
@@ -64,19 +65,37 @@ cargo run --release -p flowvoice -- --demo "эм ну то есть мы выи�
 
 ```sh
 powershell -ExecutionPolicy Bypass -File scripts/get-native.ps1
-#   vosk.dll + full RU model (~1.8 GB) + small EN model (~40 MB)
-#   + RUPunct files (~30 MB) into models/punct/
+#   whisper-server + large-v3-turbo model (~1.5 GB) into native/whisper/,
+#   models/whisper/; vosk.dll + vosk models (fallback) + RUPunct files (~30 MB)
 cargo run --release -p flowvoice --features audio
 ```
 
 Then hold **Right Ctrl** anywhere, speak, release. The formatted text is put
 into the clipboard and pasted via Ctrl+V.
 
-Models are resolved from `models/ru` (override with `FLOWVOICE_MODEL`) and
-`models/punct/` with `rupunct_small_int8.onnx` + `tokenizer.json` (override
-with `FLOWPUNCT_MODEL`). If the punct files are missing, Russian dictation
-uses the deterministic heuristic formatter instead — no error, just commas
-from rules rather than the network.
+At startup the app preloads the models in the background (`[ready] ...`
+lines); the Whisper server stays resident and is reused between restarts,
+so every press records immediately.
+
+Speech backend resolution (in order):
+1. Groq Cloud — `whisper-large-v3-turbo` over HTTPS (needs `GROQ_API_KEY`).
+   Fastest and most accurate; key at https://console.groq.com/keys, keep it
+   in the process env only, never in the repo. Override model with
+   `FLOWVOICE_GROQ_MODEL` (`whisper-large-v3` for accuracy-first).
+2. Local Whisper — `native/whisper/whisper-server.exe` +
+   `models/whisper/ggml-large-v3-turbo.bin` (overrides:
+   `FLOWVOICE_WHISPER_BIN`, `FLOWVOICE_WHISPER_MODEL`,
+   `FLOWVOICE_WHISPER_PORT` default `8178`). Fully offline fallback.
+3. Vosk fallback — `models/ru` (override with `FLOWVOICE_MODEL`).
+4. None present → error telling you to run the script above.
+
+`FLOWVOICE_LANG` (default `ru`) sets the recognition language for Groq and
+the local server; use `en` (or `auto` locally) for non-Russian dictation.
+
+Punctuation model: `models/punct/` with `rupunct_small_int8.onnx` +
+`tokenizer.json` (override with `FLOWPUNCT_MODEL`). If the punct files are
+missing, Russian dictation uses the deterministic heuristic formatter
+instead — no error, just commas from rules rather than the network.
 
 ### Path caveats (important)
 
@@ -102,7 +121,7 @@ Rust workspace monorepo:
 | `crates/flowcore` | Text engine: tokenizer, filler detection, sentence classification, heuristic commas, `format()` / `format_raw()` / `clean()`. No dependencies. |
 | `crates/punct` (`flowpunct`) | Neural punctuation: RUPunct_small token classifier on `tract-onnx` (pure Rust). Built only with the `onnx` feature; unit-tested without the model files. |
 | `crates/flowcore/src/bin/flowfmt.rs` | CLI for the formatting pipeline (stdin / args / `--lang`). |
-| `crates/app` (bin `flowvoice`) | Hotkey hook (WinAPI), audio capture (`cpal`), STT (`vosk`), clipboard paste (`arboard`). With `audio` it also wires `flowpunct`: RU transcripts go `clean()` → `Punctuator::punct()`, fallback to `format()`. |
+| `crates/app` (bin `flowvoice`) | Hotkey hook (WinAPI), audio capture (`cpal`), STT (resident `whisper-server` over localhost HTTP, Vosk fallback), clipboard paste (`arboard`). Whisper transcripts already carry punctuation, so they go `format()` (fillers + heuristic commas); Vosk transcripts go `clean()` → `Punctuator::punct()` for RU, fallback to `format()`. |
 
 The audio stack (`cpal`, `vosk`, `arboard`, `flowpunct`+`tract`) lives behind
 the `audio` feature, so the default build stays environment-agnostic and
@@ -118,8 +137,10 @@ native library.
 ```
 crates/flowcore/          text formatting engine + flowfmt CLI + tests
 crates/punct/             RUPunct neural punctuation (flowpunct crate)
-crates/app/               flowvoice binary (hook, audio, STT, paste)
+crates/app/               flowvoice binary (hook, audio, whisper/vosk STT, paste)
 native/vosk-sys/          vendored FFI bindings, runtime-loaded vosk.dll
+native/whisper/           whisper-server.exe + DLLs (downloaded, gitignored)
+models/whisper/           ggml-large-v3-turbo.bin (downloaded, gitignored)
 models/punct/             rupunct_small_int8.onnx + tokenizer.json (downloaded, gitignored)
 scripts/get-native.ps1    downloads vosk.dll, full ru / small en models, punct files
 .github/workflows/ci.yml  fmt + clippy + test + release build (Windows & Linux)

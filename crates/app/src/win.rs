@@ -6,8 +6,9 @@
 
 use std::io::Write;
 use std::os::raw::{c_int, c_void};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+
+use crate::state::{self, AppState};
 
 const WH_KEYBOARD_LL: c_int = 13;
 const WM_KEYDOWN: u32 = 0x0100;
@@ -61,9 +62,14 @@ struct Point {
     y: i32,
 }
 
-static HOTKEY: OnceLock<u16> = OnceLock::new();
+static HOTKEY: AtomicU16 = AtomicU16::new(VK_RCONTROL);
 static RECORDING: AtomicBool = AtomicBool::new(false);
 static STOP: AtomicBool = AtomicBool::new(false);
+
+/// Change the hotkey at runtime (GUI settings). Takes effect immediately.
+pub fn set_hotkey_vk(vk: u16) {
+    HOTKEY.store(vk, Ordering::SeqCst);
+}
 
 #[cfg(feature = "audio")]
 pub fn is_stop_requested() -> bool {
@@ -74,7 +80,7 @@ extern "system" fn hook_proc(code: c_int, w_param: usize, l_param: isize) -> isi
     if code >= 0 {
         // KBDLLHOOKSTRUCT starts with vkCode: u32, scanCode: u32, ...
         let vk = unsafe { *(l_param as *const u32) } as u16;
-        let hotkey = HOTKEY.get().copied().unwrap_or(VK_RCONTROL);
+        let hotkey = HOTKEY.load(Ordering::SeqCst);
 
         if vk == hotkey {
             let down = w_param == WM_KEYDOWN as usize || w_param == WM_SYSKEYDOWN as usize;
@@ -94,6 +100,10 @@ fn handle_keydown() {
     STOP.store(false, Ordering::SeqCst);
     println!("[listening] hold the key and speak...");
     let _ = std::io::stdout().flush();
+    if let Some(s) = state::get() {
+        s.set_recording(true);
+        s.push_log("[listening] hold the key and speak...".to_string());
+    }
     std::thread::spawn(spawn_recorder);
 }
 
@@ -104,14 +114,29 @@ fn handle_keyup() {
 fn spawn_recorder() {
     #[cfg(feature = "audio")]
     {
-        let text = match crate::audio::transcribe() {
-            Ok(text) => text,
+        let finish_with = |text: String, state: Option<std::sync::Arc<AppState>>| {
+            if let Some(s) = state {
+                s.set_recording(false);
+                if !text.is_empty() {
+                    s.push_history(text.clone());
+                    if let Ok(mut last) = s.last_text.lock() {
+                        *last = text.clone();
+                    }
+                }
+            }
+            finish(&text);
+        };
+        let shared = state::get();
+        match crate::audio::transcribe() {
+            Ok(text) => finish_with(text, shared),
             Err(e) => {
                 eprintln!("[error] {e}");
-                String::new()
+                if let Some(s) = &shared {
+                    s.set_recording(false);
+                    s.push_log(format!("[error] {e}"));
+                }
             }
-        };
-        finish(&text);
+        }
     }
 
     #[cfg(not(feature = "audio"))]
@@ -134,6 +159,9 @@ fn finish(text: &str) {
 
     println!("[final] {text}");
     let _ = std::io::stdout().flush();
+    if let Some(s) = state::get() {
+        s.push_log(format!("[final] {text}"));
+    }
     paste(text);
 }
 
@@ -165,15 +193,33 @@ fn paste(text: &str) {
 }
 
 /// Install the low-level keyboard hook and pump messages until quit.
+/// Blocks the calling thread; GUI mode runs the pump on a background
+/// thread via [`spawn_pump`].
 pub fn run(hotkey: Hotkey) {
-    let vk = hotkey.to_vk();
-    let _ = HOTKEY.set(vk);
+    set_hotkey_vk(hotkey.to_vk());
 
     // Warm up the speech + punctuation models in the background so the
     // first hotkey press records immediately instead of hanging on load.
     #[cfg(feature = "audio")]
     crate::audio::preload();
 
+    println!(
+        "flowvoice: hold {:?} to dictate, release to insert text (Ctrl+C to quit)",
+        hotkey.label()
+    );
+    let _ = std::io::stdout().flush();
+
+    pump();
+}
+
+/// Same hook as [`run`], but pumped on a new background thread (for GUI
+/// mode, where the main thread owns the UI event loop).
+pub fn spawn_pump(hotkey: Hotkey) {
+    set_hotkey_vk(hotkey.to_vk());
+    std::thread::spawn(pump);
+}
+
+fn pump() {
     unsafe {
         let hmod = GetModuleHandleW(std::ptr::null());
         let hook = SetWindowsHookExW(WH_KEYBOARD_LL, hook_proc as *const c_void, hmod, 0);
@@ -185,10 +231,7 @@ pub fn run(hotkey: Hotkey) {
             std::process::exit(1);
         }
 
-        println!(
-            "flowvoice: hold {:?} to dictate, release to insert text (Ctrl+C to quit)",
-            hotkey.label()
-        );
+        println!("flowvoice: hotkey hook installed");
         let _ = std::io::stdout().flush();
 
         loop {
@@ -232,7 +275,7 @@ impl Hotkey {
         }
     }
 
-    fn to_vk(self) -> u16 {
+    pub fn to_vk(self) -> u16 {
         match self {
             Hotkey::F7 => VK_F7,
             Hotkey::F8 => VK_F8,
@@ -241,7 +284,7 @@ impl Hotkey {
         }
     }
 
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Hotkey::F7 => "F7",
             Hotkey::F8 => "F8",

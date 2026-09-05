@@ -1,20 +1,21 @@
 # Downloads the runtime assets needed by the audio (mic dictation) mode:
-#   * native/vosk.dll  - Vosk speech recognition library (Windows x64)
-#   * models/ru        - FULL Russian model vosk-model-ru-0.42 (~1.8 GB, WER 4.5).
-#                        The old small model (small-ru-0.22, WER 22.71) recognized
-#                        poorly, so the full model is now the default.
-#   * models/en        - English small model (small-en-us-0.15, ~40 MB)
-#   * models/punct/    - RUPunct_small punctuation model for Russian:
-#                          rupunct_small_int8.onnx + tokenizer.json
-#                        (~30 MB) from Hugging Face.
+#   * native/vosk.dll  - Vosk speech recognition library (Windows x64, fallback)
+#   * models/ru        - FULL Russian Vosk model vosk-model-ru-0.42 (~1.8 GB,
+#                        WER 4.5). Fallback only; Whisper below is the default.
+#   * models/en        - English small Vosk model (small-en-us-0.15, ~40 MB)
+#   * models/punct/    - RUPunct_small punctuation model for Russian (~30 MB)
+#   * native/whisper/  - whisper-server.exe + DLLs (prebuilt whisper.cpp
+#                        v1.9.2 CPU; v1.9.3 shipped no binaries, hence the pin)
+#   * models/whisper/  - ggml-large-v3-turbo.bin (~1.5 GB). Default STT engine:
+#                        far bigger Russian vocabulary than Vosk.
 #
 # Usage:  powershell -ExecutionPolicy Bypass -File scripts/get-native.ps1
 #
 # Notes:
 #   * Downloads use curl.exe (Invoke-WebRequest TLS is broken in this env).
-#   * Run the app from the repo root so the relative defaults `models/ru`
-#     and `models/punct` resolve. Keep the checkout at an ASCII-only path:
-#     Kaldi cannot open model paths with Cyrillic characters.
+#   * Run the app from the repo root so the relative defaults resolve.
+#     Keep the checkout at an ASCII-only path (Kaldi/Vosk cannot open
+#     Cyrillic model paths; whisper handles them, Vosk does not).
 
 $ErrorActionPreference = "Stop"
 
@@ -100,10 +101,52 @@ $PunctDir = Join-Path $ModelsDir "punct"
 Add-PunctFile "rupunct_small_int8.onnx" $PunctDir
 Add-PunctFile "tokenizer.json" $PunctDir
 
+Write-Host "== whisper (default STT) =="
+$WhisperVer   = "v1.9.2"
+$WhisperUrl   = "https://github.com/ggml-org/whisper.cpp/releases/download/$WhisperVer/whisper-bin-x64.zip"
+$WhisperDir   = Join-Path $NativeDir "whisper"
+$WhisperExe   = Join-Path $WhisperDir "whisper-server.exe"
+$WhisperModelDir = Join-Path $ModelsDir "whisper"
+$WhisperModel = Join-Path $WhisperModelDir "ggml-large-v3-turbo.bin"
+$WhisperModelUrl = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin"
+
+if (-not (Test-Path $WhisperExe)) {
+    $zip = Join-Path $NativeDir "whisper-bin-x64.zip"
+    $tmp = Join-Path $NativeDir "whisper-tmp"
+    Save-Url $WhisperUrl $zip
+    Write-Host "  extracting $([System.IO.Path]::GetFileName($zip)) ..."
+    if (Test-Path $tmp) { Remove-Item -LiteralPath $tmp -Recurse -Force }
+    Expand-Archive -Path $zip -DestinationPath $tmp
+    $exe = Get-ChildItem -LiteralPath $tmp -Filter "whisper-server.exe" -Recurse | Select-Object -First 1
+    if (-not $exe) { throw "whisper-server.exe not found in the archive" }
+    New-Item -ItemType Directory -Force -Path $WhisperDir | Out-Null
+    Copy-Item -LiteralPath $exe.FullName -Destination $WhisperExe
+    foreach ($dll in Get-ChildItem -LiteralPath $exe.DirectoryName -Filter "*.dll") {
+        Copy-Item -LiteralPath $dll.FullName -Destination (Join-Path $WhisperDir $dll.Name)
+    }
+    $cli = Get-ChildItem -LiteralPath $tmp -Filter "whisper-cli.exe" -Recurse | Select-Object -First 1
+    if ($cli) { Copy-Item -LiteralPath $cli.FullName -Destination (Join-Path $WhisperDir "whisper-cli.exe") }
+    Remove-Item -LiteralPath $tmp -Recurse -Force
+    Remove-Item -LiteralPath $zip -ErrorAction SilentlyContinue
+    Write-Host "  whisper-server ready at $WhisperExe"
+} else {
+    Write-Host "  already present: $WhisperExe"
+}
+New-Item -ItemType Directory -Force -Path $WhisperModelDir | Out-Null
+if (-not (Test-Path $WhisperModel)) {
+    Write-Host "  downloading ggml-large-v3-turbo.bin (~1.5 GB, takes a while) ..."
+}
+Save-Url $WhisperModelUrl $WhisperModel
+Write-Host "  whisper model ready at $WhisperModel"
+
 Write-Host ""
 Write-Host "Done."
 Write-Host "  native = $VoskDll"
 Write-Host "  models = $ModelsDir"
 Write-Host ""
 Write-Host "Run:  cargo run --release -p flowvoice --features audio"
-Write-Host "Env:  FLOWVOICE_MODEL (default models/ru), FLOWPUNCT_MODEL (default models/punct)"
+Write-Host "Tip:  set GROQ_API_KEY for cloud whisper (fastest), local engines stay as fallback"
+Write-Host "Env:  FLOWVOICE_MODEL (vosk dir, fallback), FLOWPUNCT_MODEL (default models/punct)"
+Write-Host "      FLOWVOICE_WHISPER_MODEL (default models/whisper/ggml-large-v3-turbo.bin)"
+Write-Host "      FLOWVOICE_WHISPER_BIN (default native/whisper/whisper-server.exe)"
+Write-Host "      FLOWVOICE_WHISPER_PORT (default 8178), FLOWVOICE_LANG (default ru)"

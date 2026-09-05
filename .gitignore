@@ -1,6 +1,7 @@
 /target
 /models
 /native/vosk.dll
+/native/whisper
 /native/*.zip
 /native/libgcc_s_seh-1.dll
 /native/libstdc++-6.dll

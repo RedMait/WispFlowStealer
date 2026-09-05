@@ -14,10 +14,18 @@ flowpunct = { path = "../punct", optional = true, features = ["onnx"] }
 cpal = { version = "0.15", optional = true }
 vosk = { version = "0.3", optional = true }
 arboard = { version = "3.4", optional = true }
+serde_json = { version = "1", optional = true }
+chrono = { version = "0.4", optional = true }
+eframe = { version = "0.36", optional = true, default-features = false, features = ["default_fonts", "glow"] }
+tray-icon = { version = "0.24", optional = true }
 
 [features]
 default = []
 # Full dictation pipeline: microphone capture + local speech-to-text + clipboard.
 # Adds the ML punctuation module, so the audio build also compiles `tract`.
 # Native speech libs make this Windows-friendly; build it locally for the demo.
-audio = ["dep:cpal", "dep:vosk", "dep:arboard", "dep:flowpunct"]
+audio = ["dep:cpal", "dep:vosk", "dep:arboard", "dep:flowpunct", "dep:serde_json"]
+# Desktop GUI: eframe window (status, settings, history, recording overlay)
+# plus a system-tray icon. Implies serde_json for the settings/history files,
+# chrono for history timestamps and arboard for the history copy buttons.
+gui = ["dep:eframe", "dep:tray-icon", "dep:serde_json", "dep:chrono", "dep:arboard"]
