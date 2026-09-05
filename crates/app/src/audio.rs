@@ -21,6 +21,37 @@ fn default_model_path() -> String {
     std::env::var("FLOWVOICE_MODEL").unwrap_or_else(|_| "models/ru".to_string())
 }
 
+/// Vosk model shared by every dictation, loaded exactly once.
+///
+/// Reloading it per hotkey press cost seconds (the full RU model is ~1.8 GB)
+/// and — worse — the microphone only opened *after* the load, so the start
+/// of the utterance was silently lost. Warmed up by [`preload`].
+static MODEL: OnceLock<Result<Model, String>> = OnceLock::new();
+
+fn model_instance() -> Result<&'static Model, String> {
+    MODEL
+        .get_or_init(|| {
+            let path = default_model_path();
+            Model::new(path.clone()).ok_or_else(|| format!("cannot load vosk model from `{path}`"))
+        })
+        .as_ref()
+        .map_err(|e| e.clone())
+}
+
+/// Load the heavy models in the background at startup so the first hotkey
+/// press starts recording immediately instead of hanging on model load.
+pub fn preload() {
+    std::thread::spawn(|| {
+        match model_instance() {
+            Ok(_) => println!("[ready] speech model loaded"),
+            Err(e) => eprintln!("[error] {e}"),
+        }
+        if punct_instance().is_some() {
+            println!("[ready] punctuation model loaded");
+        }
+    });
+}
+
 /// Directory holding the RUPunct punctuation model, or `None` when absent.
 /// Override via the `FLOWPUNCT_MODEL` env var.
 fn punct_dir() -> PathBuf {
@@ -65,15 +96,15 @@ fn finalize(text: String) -> String {
 }
 
 /// Capture until the hotkey is released, recognize, return the transcript.
+/// The Vosk model is cached (see [`preload`]), so this starts recording
+/// immediately on every press after the first.
 pub fn transcribe() -> Result<String, String> {
-    let model_path = default_model_path();
-    let model = Model::new(model_path.clone())
-        .ok_or_else(|| format!("cannot load vosk model from `{model_path}`"))?;
+    let model = model_instance()?;
 
     let (pcm, rate) = capture_until_stop()?;
     let pcm16k = resample_to_16k(&pcm, rate);
 
-    let mut recognizer = Recognizer::new(&model, TARGET_SAMPLE_RATE as f32)
+    let mut recognizer = Recognizer::new(model, TARGET_SAMPLE_RATE as f32)
         .ok_or_else(|| "cannot create vosk recognizer".to_string())?;
 
     for chunk in pcm16k.chunks(TARGET_SAMPLE_RATE as usize * 2) {

@@ -9,9 +9,6 @@ use std::os::raw::{c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
-#[cfg(feature = "audio")]
-use flowcore::{format, Language};
-
 const WH_KEYBOARD_LL: c_int = 13;
 const WM_KEYDOWN: u32 = 0x0100;
 const WM_SYSKEYDOWN: u32 = 0x0104;
@@ -127,18 +124,17 @@ fn spawn_recorder() {
 }
 
 #[cfg(feature = "audio")]
-fn finish(raw: &str) {
-    let lang = Language::detect(raw);
-    let formatted = format(raw, lang);
-
-    if formatted.is_empty() {
+/// `transcribe()` already returns finalized text (neural punctuation for RU
+/// when available, heuristic formatting otherwise) — paste it as-is.
+fn finish(text: &str) {
+    if text.is_empty() {
         println!("[done] no speech detected");
         return;
     }
 
-    println!("[final] {formatted}");
+    println!("[final] {text}");
     let _ = std::io::stdout().flush();
-    paste(&formatted);
+    paste(text);
 }
 
 #[cfg(feature = "audio")]
@@ -172,6 +168,11 @@ fn paste(text: &str) {
 pub fn run(hotkey: Hotkey) {
     let vk = hotkey.to_vk();
     let _ = HOTKEY.set(vk);
+
+    // Warm up the speech + punctuation models in the background so the
+    // first hotkey press records immediately instead of hanging on load.
+    #[cfg(feature = "audio")]
+    crate::audio::preload();
 
     unsafe {
         let hmod = GetModuleHandleW(std::ptr::null());
