@@ -64,7 +64,9 @@ impl Language {
                 "хм",
                 "э",
                 "м",
-                "а",
+                // NOTE: no bare "а" — it is a live conjunction
+                // ("а также", "а потом") and must survive.
+                "аа",
             ],
             Language::En => &[
                 "you know",
@@ -521,6 +523,12 @@ fn join_tokens(tokens: &[Token], lang: Language) -> String {
             Token::Punct(c) => {
                 if s.is_empty() {
                     continue; // never start with stray punctuation
+                }
+                // Glue to the previous token: no space before a mark and
+                // none between back-to-back marks ("12% ," -> "12%,",
+                // "готово. ," -> "готово.,").
+                while s.ends_with(char::is_whitespace) {
+                    s.pop();
                 }
                 s.push(*c);
                 s.push(' ');

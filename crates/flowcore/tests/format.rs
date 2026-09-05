@@ -160,6 +160,22 @@ fn clean_returns_bare_lowercase_words() {
 }
 
 #[test]
+fn conjunction_a_survives_and_punct_glues() {
+    // Bare "а" is a live conjunction, not a filler.
+    assert_eq!(ru("а также пирожок"), "А также пирожок.");
+    assert_eq!(
+        ru("тоже хочу чаю, а также пирожок"),
+        "Тоже хочу чаю, а также пирожок."
+    );
+    // Back-to-back punctuation from the recognizer stays glued.
+    assert_eq!(ru("привет., мир"), "Привет., мир.");
+    assert_eq!(
+        ru("выручка выросла на 12%, но упала"),
+        "Выручка выросла на 12%, но упала."
+    );
+}
+
+#[test]
 fn whitespace_and_double_spaces_are_normalized() {
     assert_eq!(ru("привет    мир"), "Привет мир.");
     assert_eq!(ru("  я   иду   домой  "), "Я иду домой.");

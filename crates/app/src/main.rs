@@ -12,7 +12,7 @@ mod whisper;
 #[cfg(windows)]
 mod win;
 
-#[cfg(windows)]
+#[cfg(all(windows, any(feature = "audio", feature = "gui")))]
 mod state;
 
 #[cfg(all(windows, feature = "gui"))]
@@ -106,6 +106,8 @@ fn print_help() {
     println!();
     println!("ENV:");
     println!("  GROQ_API_KEY         Groq Cloud whisper (primary when set; keep it secret)");
+    println!("  FLOWVOICE_GROQ_MODEL Groq model id (default whisper-large-v3-turbo)");
+    println!("  FLOWVOICE_GROQ_PROMPT vocabulary hint, e.g. domain words (optional)");
     println!("  FLOWVOICE_MODEL    path to a Vosk model directory (default models/ru)");
     println!("  FLOWPUNCT_MODEL    dir with rupunct_small_int8.onnx + tokenizer.json (default models/punct)");
     println!();

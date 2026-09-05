@@ -52,11 +52,18 @@ fn temp_wav_path() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("flowvoice-{}-{n}.wav", std::process::id()))
 }
 
+/// Optional style/vocabulary hint (`FLOWVOICE_GROQ_PROMPT`), e.g.
+/// domain words the recognizer keeps misspelling ("маржа, выручка,
+/// тенге, созвонимся"). Sent as the `prompt` field; empty by default.
+fn prompt() -> String {
+    std::env::var("FLOWVOICE_GROQ_PROMPT").unwrap_or_default()
+}
+
 /// Upload one wav file with curl.exe, extract `{"text": ...}`.
 fn post_wav(path: &std::path::Path, key: &str) -> Result<String, String> {
     let file_arg = format!("file=@{};type=audio/wav", path.display());
-    let out = Command::new("curl.exe")
-        .arg("-sS")
+    let mut cmd = Command::new("curl.exe");
+    cmd.arg("-sS")
         .arg("--max-time")
         .arg("180")
         .arg("-X")
@@ -73,7 +80,11 @@ fn post_wav(path: &std::path::Path, key: &str) -> Result<String, String> {
         .arg("-F")
         .arg("response_format=json")
         .arg("-F")
-        .arg("temperature=0.0")
+        .arg("temperature=0.0");
+    if !prompt().is_empty() {
+        cmd.arg("-F").arg(format!("prompt={}", prompt()));
+    }
+    let out = cmd
         .output()
         .map_err(|e| format!("cannot run curl.exe: {e}"))?;
 

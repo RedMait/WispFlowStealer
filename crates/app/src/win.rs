@@ -8,6 +8,7 @@ use std::io::Write;
 use std::os::raw::{c_int, c_void};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
+#[cfg(any(feature = "audio", feature = "gui"))]
 use crate::state::{self, AppState};
 
 const WH_KEYBOARD_LL: c_int = 13;
@@ -100,6 +101,7 @@ fn handle_keydown() {
     STOP.store(false, Ordering::SeqCst);
     println!("[listening] hold the key and speak...");
     let _ = std::io::stdout().flush();
+    #[cfg(any(feature = "audio", feature = "gui"))]
     if let Some(s) = state::get() {
         s.set_recording(true);
         s.push_log("[listening] hold the key and speak...".to_string());
@@ -214,6 +216,7 @@ pub fn run(hotkey: Hotkey) {
 
 /// Same hook as [`run`], but pumped on a new background thread (for GUI
 /// mode, where the main thread owns the UI event loop).
+#[cfg(feature = "gui")]
 pub fn spawn_pump(hotkey: Hotkey) {
     set_hotkey_vk(hotkey.to_vk());
     std::thread::spawn(pump);

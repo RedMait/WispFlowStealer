@@ -89,6 +89,11 @@ Speech backend resolution (in order):
 3. Vosk fallback — `models/ru` (override with `FLOWVOICE_MODEL`).
 4. None present → error telling you to run the script above.
 
+When Groq keeps misspelling a domain word (e.g. «маржа» → «Маша»),
+set `FLOWVOICE_GROQ_PROMPT` with a hint, e.g.
+`маржа, выручка, тенге, созвонимся` — it is sent as the `prompt`
+field and biases spelling without touching anything else.
+
 `FLOWVOICE_LANG` (default `ru`) sets the recognition language for Groq and
 the local server; use `en` (or `auto` locally) for non-Russian dictation.
 

@@ -19,10 +19,12 @@ pub enum BackendPref {
 }
 
 impl BackendPref {
+    #[cfg(feature = "gui")]
     pub fn all() -> &'static [BackendPref] {
         &[Self::Auto, Self::Groq, Self::Local, Self::Vosk]
     }
 
+    #[cfg(feature = "gui")]
     pub fn label(self) -> &'static str {
         match self {
             Self::Auto => "auto",
@@ -32,6 +34,7 @@ impl BackendPref {
         }
     }
 
+    #[cfg(any(feature = "audio", feature = "gui"))]
     pub fn parse(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
             "groq" | "groq cloud" => Self::Groq,
@@ -42,6 +45,7 @@ impl BackendPref {
     }
 
     /// Env override (`FLOWVOICE_BACKEND`), `None` when unset/invalid.
+    #[cfg(any(feature = "audio", feature = "gui"))]
     pub fn from_env() -> Option<Self> {
         std::env::var("FLOWVOICE_BACKEND")
             .ok()
@@ -55,20 +59,24 @@ impl BackendPref {
             })
     }
 
+    #[cfg(feature = "audio")]
     pub fn allows_groq(self) -> bool {
         matches!(self, Self::Auto | Self::Groq)
     }
 
+    #[cfg(feature = "audio")]
     pub fn allows_local(self) -> bool {
         matches!(self, Self::Auto | Self::Local)
     }
 
+    #[cfg(feature = "audio")]
     pub fn allows_vosk(self) -> bool {
         matches!(self, Self::Auto | Self::Vosk)
     }
 }
 
 /// GUI-editable settings (persisted as JSON by the GUI; env wins at runtime).
+#[cfg(feature = "gui")]
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub hotkey: String,
@@ -77,6 +85,7 @@ pub struct Settings {
     pub backend: BackendPref,
 }
 
+#[cfg(feature = "gui")]
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -88,8 +97,10 @@ impl Default for Settings {
     }
 }
 
-/// One pasted dictation.
+/// One pasted dictation. Fields are consumed by the GUI; without it the
+/// entries are still collected (cheap) but never read.
 #[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub struct HistoryEntry {
     pub when: std::time::SystemTime,
     pub text: String,
@@ -118,6 +129,7 @@ pub struct AppState {
 }
 
 impl AppState {
+    #[cfg(feature = "gui")]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             recording: AtomicBool::new(false),
@@ -141,6 +153,7 @@ impl AppState {
         self.kick_ui();
     }
 
+    #[cfg(feature = "gui")]
     pub fn recording_secs(&self) -> u64 {
         self.record_started
             .lock()
@@ -160,6 +173,7 @@ impl AppState {
         self.kick_ui();
     }
 
+    #[cfg(feature = "gui")]
     pub fn recent_log(&self) -> Vec<String> {
         self.log
             .lock()
@@ -202,6 +216,7 @@ impl AppState {
 /// without signature churn. `None` in console mode without `--gui`.
 static STATE: OnceLock<Arc<AppState>> = OnceLock::new();
 
+#[cfg(feature = "gui")]
 pub fn attach(state: Arc<AppState>) {
     let _ = STATE.set(state);
 }
