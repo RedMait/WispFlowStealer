@@ -1,0 +1,83 @@
+mod demo;
+
+#[cfg(all(windows, feature = "audio"))]
+mod audio;
+
+#[cfg(windows)]
+mod win;
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        print_help();
+        return;
+    }
+
+    if let Some(text) = parse_demo_arg(&args) {
+        demo::run(&text);
+        return;
+    }
+
+    #[cfg(windows)]
+    {
+        let key = parse_key_arg(&args).unwrap_or_default();
+        win::run(key);
+    }
+
+    #[cfg(not(windows))]
+    {
+        eprintln!("Hotkey dictation currently requires Windows.");
+        eprintln!("On any platform you can try the demo:");
+        eprintln!("  cargo run -p flowvoice -- --demo \"hello world\"");
+        std::process::exit(2);
+    }
+}
+
+/// `--demo <text...>` runs the full pipeline on static text.
+/// Useful for slides, CI, and machines without a microphone.
+fn parse_demo_arg(args: &[String]) -> Option<String> {
+    let mut rest: Vec<String> = Vec::new();
+    let mut found = false;
+    let mut iter = args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        if arg == "--demo" {
+            found = true;
+            for a in iter {
+                rest.push(a.clone());
+            }
+            break;
+        }
+    }
+    if found && !rest.is_empty() {
+        Some(rest.join(" "))
+    } else {
+        None
+    }
+}
+
+#[cfg(windows)]
+fn parse_key_arg(args: &[String]) -> Option<win::Hotkey> {
+    let mut iter = args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        if arg == "--key" {
+            if let Some(name) = iter.next() {
+                return win::Hotkey::parse(name);
+            }
+        }
+    }
+    None
+}
+
+fn print_help() {
+    println!("flowvoice - hold-to-talk voice dictation with auto-formatting");
+    println!();
+    println!("USAGE:");
+    println!("  flowvoice [--key <F8|RCONTROL|F7|...>]   hotkey dictation (Windows only)");
+    println!("  flowvoice --demo <text...>               run the formatting pipeline on text");
+    println!();
+    println!("ENV:");
+    println!("  FLOWVOICE_MODEL    path to a Vosk model directory (default models/ru)");
+    println!();
+    println!("DEFAULT HOTKEY: hold Right Ctrl to dictate, release to insert formatted text");
+}

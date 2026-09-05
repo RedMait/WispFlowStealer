@@ -1,0 +1,251 @@
+﻿//! Windows-only implementation of the hold-to-talk UX using raw WinAPI.
+//!
+//! A low-level keyboard hook (`WH_KEYBOARD_LL`) detects when the hotkey is
+//! pressed down and released. On press a recorder thread starts; on release
+//! it is told to stop, the transcript is formatted and pasted as Ctrl+V.
+
+use std::io::Write;
+use std::os::raw::{c_int, c_void};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+
+#[cfg(feature = "audio")]
+use flowcore::{format, Language};
+
+const WH_KEYBOARD_LL: c_int = 13;
+const WM_KEYDOWN: u32 = 0x0100;
+const WM_SYSKEYDOWN: u32 = 0x0104;
+const WM_QUIT: u32 = 0x0012;
+
+#[cfg(feature = "audio")]
+const KEYEVENTF_KEYUP: u32 = 0x0002;
+#[cfg(feature = "audio")]
+const VK_CONTROL: u16 = 0x11;
+#[cfg(feature = "audio")]
+const VK_V: u16 = 0x56;
+const VK_F7: u16 = 0x76;
+const VK_F8: u16 = 0x77;
+const VK_F9: u16 = 0x78;
+const VK_RCONTROL: u16 = 0xA3;
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn SetWindowsHookExW(
+        id_hook: c_int,
+        lpfn: *const c_void,
+        h_mod: *const c_void,
+        dw_thread_id: u32,
+    ) -> isize;
+    fn UnhookWindowsHookEx(hhk: isize) -> c_int;
+    fn CallNextHookEx(hhk: isize, n_code: c_int, w_param: usize, l_param: isize) -> isize;
+    fn GetMessageW(msg: *mut Msg, hwnd: *const c_void, min: u32, max: u32) -> c_int;
+    fn TranslateMessage(msg: *const Msg) -> c_int;
+    fn DispatchMessageW(msg: *const Msg) -> isize;
+    fn GetModuleHandleW(name: *const u16) -> *const c_void;
+    fn GetLastError() -> u32;
+    #[cfg(feature = "audio")]
+    fn keybd_event(b_vk: u8, b_scan: u8, dw_flags: u32, dw_extra: usize);
+}
+
+#[repr(C)]
+struct Msg {
+    hwnd: *const c_void,
+    message: u32,
+    w_param: usize,
+    l_param: isize,
+    time: u32,
+    pt: Point,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+static HOTKEY: OnceLock<u16> = OnceLock::new();
+static RECORDING: AtomicBool = AtomicBool::new(false);
+static STOP: AtomicBool = AtomicBool::new(false);
+
+#[cfg(feature = "audio")]
+pub fn is_stop_requested() -> bool {
+    STOP.load(Ordering::SeqCst)
+}
+
+extern "system" fn hook_proc(code: c_int, w_param: usize, l_param: isize) -> isize {
+    if code >= 0 {
+        // KBDLLHOOKSTRUCT starts with vkCode: u32, scanCode: u32, ...
+        let vk = unsafe { *(l_param as *const u32) } as u16;
+        let hotkey = HOTKEY.get().copied().unwrap_or(VK_RCONTROL);
+
+        if vk == hotkey {
+            let down = w_param == WM_KEYDOWN as usize || w_param == WM_SYSKEYDOWN as usize;
+            if down {
+                if !RECORDING.swap(true, Ordering::SeqCst) {
+                    handle_keydown();
+                }
+            } else if RECORDING.swap(false, Ordering::SeqCst) {
+                handle_keyup();
+            }
+        }
+    }
+    unsafe { CallNextHookEx(0, code, w_param, l_param) }
+}
+
+fn handle_keydown() {
+    STOP.store(false, Ordering::SeqCst);
+    println!("[listening] hold the key and speak...");
+    let _ = std::io::stdout().flush();
+    std::thread::spawn(spawn_recorder);
+}
+
+fn handle_keyup() {
+    STOP.store(true, Ordering::SeqCst);
+}
+
+fn spawn_recorder() {
+    #[cfg(feature = "audio")]
+    {
+        let text = match crate::audio::transcribe() {
+            Ok(text) => text,
+            Err(e) => {
+                eprintln!("[error] {e}");
+                String::new()
+            }
+        };
+        finish(&text);
+    }
+
+    #[cfg(not(feature = "audio"))]
+    {
+        eprintln!(
+            "[audio] not available: rebuild with `cargo build -p flowvoice --features audio`"
+        );
+        STOP.store(true, Ordering::SeqCst);
+    }
+}
+
+#[cfg(feature = "audio")]
+fn finish(raw: &str) {
+    let lang = Language::detect(raw);
+    let formatted = format(raw, lang);
+
+    if formatted.is_empty() {
+        println!("[done] no speech detected");
+        return;
+    }
+
+    println!("[final] {formatted}");
+    let _ = std::io::stdout().flush();
+    paste(&formatted);
+}
+
+#[cfg(feature = "audio")]
+/// Copy the text to the clipboard and simulate Ctrl+V. Pasting is the
+/// fastest way to enter arbitrary Unicode text reliably.
+fn paste(text: &str) {
+    #[cfg(feature = "audio")]
+    {
+        let mut cb = match arboard::Clipboard::new() {
+            Ok(cb) => cb,
+            Err(e) => {
+                eprintln!("[error] cannot open clipboard: {e}");
+                return;
+            }
+        };
+        if let Err(e) = cb.set_text(text) {
+            eprintln!("[error] cannot write clipboard: {e}");
+            return;
+        }
+    }
+
+    unsafe {
+        keybd_event(VK_CONTROL as u8, 0, 0, 0);
+        keybd_event(VK_V as u8, 0, 0, 0);
+        keybd_event(VK_V as u8, 0, KEYEVENTF_KEYUP, 0);
+        keybd_event(VK_CONTROL as u8, 0, KEYEVENTF_KEYUP, 0);
+    }
+}
+
+/// Install the low-level keyboard hook and pump messages until quit.
+pub fn run(hotkey: Hotkey) {
+    let vk = hotkey.to_vk();
+    let _ = HOTKEY.set(vk);
+
+    unsafe {
+        let hmod = GetModuleHandleW(std::ptr::null());
+        let hook = SetWindowsHookExW(WH_KEYBOARD_LL, hook_proc as *const c_void, hmod, 0);
+        if hook == 0 {
+            eprintln!(
+                "[error] cannot install keyboard hook (error {})",
+                GetLastError()
+            );
+            std::process::exit(1);
+        }
+
+        println!(
+            "flowvoice: hold {:?} to dictate, release to insert text (Ctrl+C to quit)",
+            hotkey.label()
+        );
+        let _ = std::io::stdout().flush();
+
+        loop {
+            let mut msg = Msg {
+                hwnd: std::ptr::null(),
+                message: 0,
+                w_param: 0,
+                l_param: 0,
+                time: 0,
+                pt: Point { x: 0, y: 0 },
+            };
+            let ret = GetMessageW(&mut msg, std::ptr::null(), 0, 0);
+            if ret <= 0 || msg.message == WM_QUIT {
+                break;
+            }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+
+        UnhookWindowsHookEx(hook);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Hotkey {
+    F7,
+    F8,
+    F9,
+    #[default]
+    RightControl,
+}
+
+impl Hotkey {
+    pub fn parse(name: &str) -> Option<Hotkey> {
+        match name.to_ascii_uppercase().as_str() {
+            "F7" => Some(Hotkey::F7),
+            "F8" => Some(Hotkey::F8),
+            "F9" => Some(Hotkey::F9),
+            "RCONTROL" | "RIGHT_CONTROL" | "RCTRL" => Some(Hotkey::RightControl),
+            _ => None,
+        }
+    }
+
+    fn to_vk(self) -> u16 {
+        match self {
+            Hotkey::F7 => VK_F7,
+            Hotkey::F8 => VK_F8,
+            Hotkey::F9 => VK_F9,
+            Hotkey::RightControl => VK_RCONTROL,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Hotkey::F7 => "F7",
+            Hotkey::F8 => "F8",
+            Hotkey::F9 => "F9",
+            Hotkey::RightControl => "Right Ctrl",
+        }
+    }
+}

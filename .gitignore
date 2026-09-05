@@ -1,0 +1,7 @@
+/target
+/models
+/native/vosk.dll
+/native/*.zip
+*.log
+.idea/
+.vscode/

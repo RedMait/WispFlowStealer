@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/flowcore", "crates/app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/RedMait/WispFlowStealer"
+rust-version = "1.75"
+
+# Vendored fork: Windows builds link vosk.dll via `raw-dylib` (no .lib needed).
+[patch.crates-io]
+vosk-sys = { path = "native/vosk-sys" }
