@@ -2,6 +2,9 @@
 /models
 /native/vosk.dll
 /native/*.zip
+/native/libgcc_s_seh-1.dll
+/native/libstdc++-6.dll
+/native/libwinpthread-1.dll
 *.log
 .idea/
 .vscode/

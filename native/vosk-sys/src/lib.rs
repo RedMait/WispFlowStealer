@@ -52,9 +52,20 @@ type Hmodule = *mut c_void;
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
-    fn LoadLibraryW(name: *const u16) -> Hmodule;
+    /// LoadLibraryExW with custom search flags.
+    ///
+    /// The returned HMODULE must not be FreeLibrary'd by us: the process keeps
+    /// the library loaded for its lifetime.
+    fn LoadLibraryExW(name: *const u16, file: Hmodule, flags: u32) -> Hmodule;
     fn GetProcAddress(h_module: Hmodule, name: *const c_char) -> *mut c_void;
 }
+
+// LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS.
+//
+// The default dirs flag alone does NOT include the directory the loaded DLL
+// lives in, but the mingw runtime (libgcc_s, libstdc++-6, libwinpthread)
+// stored next to vosk.dll must be resolvable — hence DLL_LOAD_DIR.
+const LOAD_FLAGS: u32 = 0x100 | 0x010;
 
 /// Raw handles are not Send/Sync, so we cache them as usize and convert back.
 static VOSK_DLL: OnceLock<Option<usize>> = OnceLock::new();
@@ -67,10 +78,19 @@ fn get_dll() -> Option<Hmodule> {
 }
 
 fn load_dll() -> Option<usize> {
-    for candidate in ["vosk.dll", "native\\vosk.dll", "native/vosk.dll"] {
+    let mut candidates: Vec<String> = vec!["vosk.dll".into()];
+    // LOAD_LIBRARY_SEARCH_* flags exclude the current directory, so relative
+    // candidates must be made absolute ourselves before passing them along.
+    if let Ok(cwd) = std::env::current_dir() {
+        for native in ["native", "native/"] {
+            let p = cwd.join(native).join("vosk.dll");
+            candidates.push(p.to_string_lossy().into_owned());
+        }
+    }
+    for candidate in &candidates {
         let wide_name: Vec<u16> = candidate.encode_utf16().chain(std::iter::once(0)).collect();
         // SAFETY: wide_name is a valid NUL-terminated UTF-16 path.
-        let handle = unsafe { LoadLibraryW(wide_name.as_ptr()) };
+        let handle = unsafe { LoadLibraryExW(wide_name.as_ptr(), std::ptr::null_mut(), LOAD_FLAGS) };
         if !handle.is_null() {
             return Some(handle as usize);
         }

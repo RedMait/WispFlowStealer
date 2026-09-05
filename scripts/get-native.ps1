@@ -7,18 +7,27 @@
 
 $ErrorActionPreference = "Stop"
 
+# Windows PowerShell 5.1 defaults to TLS 1.0; force a modern protocol.
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
 $Repo      = Split-Path -Parent $PSScriptRoot
 $NativeDir = Join-Path $Repo "native"
 $ModelsDir = Join-Path $Repo "models"
 $VoskDll   = Join-Path $NativeDir "vosk.dll"
 $Base      = "https://alphacephei.com/vosk/models"
+$VoskUrl   = "https://github.com/alphacep/vosk-api/releases/download/v0.3.45/vosk-win64-0.3.45.zip"
 
 New-Item -ItemType Directory -Force -Path $NativeDir, $ModelsDir | Out-Null
 
 function Save-Zip([string]$Url, [string]$Zip) {
     if (-not (Test-Path $Zip)) {
         Write-Host "  downloading $([System.IO.Path]::GetFileName($Zip)) ..."
-        Invoke-WebRequest -Uri $Url -OutFile $Zip
+        try {
+            Invoke-WebRequest -Uri $Url -OutFile $Zip
+        } catch {
+            Remove-Item -LiteralPath $Zip -ErrorAction SilentlyContinue
+            throw
+        }
     }
 }
 
@@ -38,13 +47,21 @@ function Add-Model([string]$ZipName, [string]$Dest) {
 
 Write-Host "== vosk.dll =="
 if (-not (Test-Path $VoskDll)) {
-    $zip = Join-Path $NativeDir "vosk-win64-0.3.45.zip"
-    Save-Zip "$Base/vosk-win64-0.3.45.zip" $zip
+    $zip    = Join-Path $NativeDir "vosk-win64-0.3.45.zip"
+    $srcDir = Join-Path $NativeDir "vosk-win64-0.3.45"
+    Save-Zip $VoskUrl $zip
     Write-Host "  extracting $([System.IO.Path]::GetFileName($zip))"
+    if (Test-Path $srcDir) { Remove-Item -LiteralPath $srcDir -Recurse -Force }
     Expand-Archive -Path $zip -DestinationPath $NativeDir
-    $dll = Get-ChildItem -LiteralPath $NativeDir -Recurse -Filter "vosk.dll" | Select-Object -First 1
-    if (-not $dll) { throw "vosk.dll not found in the archive" }
-    Move-Item -LiteralPath $dll.FullName -Destination $VoskDll -Force
+    $libdll = Get-ChildItem -LiteralPath $srcDir -Filter "libvosk.dll" | Select-Object -First 1
+    if (-not $libdll) { throw "libvosk.dll not found in the archive" }
+    Copy-Item -LiteralPath $libdll.FullName -Destination $VoskDll
+    foreach ($dep in "libgcc_s_seh-1.dll", "libstdc++-6.dll", "libwinpthread-1.dll") {
+        $runc = Join-Path $srcDir $dep
+        if (Test-Path $runc) { Copy-Item -LiteralPath $runc -Destination (Join-Path $NativeDir $dep) }
+    }
+    Write-Host "  vosk.dll ready (with mingw runtime deps)"
+    Remove-Item -LiteralPath $srcDir -Recurse -Force
     Remove-Item -LiteralPath $zip -ErrorAction SilentlyContinue
 } else {
     Write-Host "  already present: $VoskDll"
