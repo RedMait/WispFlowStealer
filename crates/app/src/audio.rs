@@ -147,15 +147,13 @@ pub fn transcribe() -> Result<String, String> {
     if pref.allows_groq() && crate::groq::available() {
         let raw = crate::groq::transcribe_pcm(&pcm16k)?;
         set_label("groq cloud");
-        let lang = Language::detect(&raw);
-        return Ok(flowcore::format(&raw, lang));
+        return Ok(format_segments(raw));
     }
 
     if pref.allows_local() && crate::whisper::available() {
         let raw = crate::whisper::transcribe_pcm(&pcm16k)?;
         set_label("whisper local");
-        let lang = Language::detect(&raw);
-        return Ok(flowcore::format(&raw, lang));
+        return Ok(format_segments(raw));
     }
 
     if pref.allows_vosk() {
@@ -165,6 +163,20 @@ pub fn transcribe() -> Result<String, String> {
     }
 
     Err("no speech backend enabled: set GROQ_API_KEY or run scripts/get-native.ps1".to_string())
+}
+
+/// Format every whisper segment as its own sentence and join them.
+/// Segments track utterance boundaries, so each one gets its own terminal
+/// mark ("…скрипт. Хочу…"); filler-only fragments format to empty and drop.
+fn format_segments(raw: Vec<String>) -> String {
+    raw.into_iter()
+        .map(|seg| {
+            let lang = Language::detect(&seg);
+            flowcore::format(&seg, lang)
+        })
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Run the cached Vosk model over buffered audio, return the raw transcript.

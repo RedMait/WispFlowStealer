@@ -141,6 +141,7 @@ struct GuiApp {
     status_line: String,
     tray: Option<TrayIcon>,
     show_item: MenuItem,
+    pause_item: MenuItem,
     quit_item: MenuItem,
     quit_requested: bool,
     icon_recording: bool,
@@ -162,6 +163,19 @@ impl GuiApp {
         for event in MenuEvent::receiver().try_iter() {
             if event.id == self.show_item.id() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            } else if event.id == self.pause_item.id() {
+                let paused = win::is_enabled();
+                win::set_enabled(!paused);
+                self.pause_item.set_text(if paused {
+                    "Слушать"
+                } else {
+                    "Пауза"
+                });
+                self.state.push_log(if paused {
+                    "[gui] dictation paused (tray)".to_string()
+                } else {
+                    "[gui] dictation resumed (tray)".to_string()
+                });
             } else if event.id == self.quit_item.id() {
                 self.quit_requested = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -222,16 +236,22 @@ impl GuiApp {
             .recording
             .load(std::sync::atomic::Ordering::SeqCst);
         ui.horizontal(|ui| {
-            if recording {
+            if !win::is_enabled() {
+                ui.label(
+                    egui::RichText::new("[пауза]")
+                        .color(egui::Color32::from_rgb(150, 150, 150))
+                        .strong(),
+                );
+            } else if recording {
                 let secs = self.state.recording_secs();
                 ui.label(
-                    egui::RichText::new(format!("● ЗАПИСЬ {secs} c"))
+                    egui::RichText::new(format!("[ЗАПИСЬ {secs} c]"))
                         .color(egui::Color32::from_rgb(230, 60, 60))
                         .strong(),
                 );
             } else {
                 ui.label(
-                    egui::RichText::new("● готов")
+                    egui::RichText::new("[готов]")
                         .color(egui::Color32::from_rgb(80, 200, 120))
                         .strong(),
                 );
@@ -243,6 +263,21 @@ impl GuiApp {
                 .map(|b| b.clone())
                 .unwrap_or_default();
             ui.label(format!("бэкенд: {backend}"));
+            // Master switch: pause/resume dictation, window stays open.
+            let paused = !win::is_enabled();
+            let label = if paused {
+                "Слушать (вкл)"
+            } else {
+                "Пауза (выкл)"
+            };
+            if ui.button(label).clicked() {
+                win::set_enabled(paused);
+                self.state.push_log(if paused {
+                    "[gui] dictation resumed".to_string()
+                } else {
+                    "[gui] dictation paused".to_string()
+                });
+            }
         });
         let last = self
             .state
@@ -287,12 +322,23 @@ impl GuiApp {
         });
         ui.horizontal(|ui| {
             ui.label("Язык:");
-            ui.text_edit_singleline(&mut self.settings.lang);
-            ui.label("(ru / en / auto — только локальный движок)");
+            ui.add_sized(
+                [60.0, 22.0],
+                egui::TextEdit::singleline(&mut self.settings.lang),
+            );
+            ui.label(egui::RichText::new("ru / en").weak().small());
         });
+        ui.label(
+            egui::RichText::new("auto — только локальный движок")
+                .weak()
+                .small(),
+        );
         ui.horizontal(|ui| {
             ui.label("Groq-модель:");
-            ui.text_edit_singleline(&mut self.settings.groq_model);
+            ui.add_sized(
+                [280.0, 22.0],
+                egui::TextEdit::singleline(&mut self.settings.groq_model),
+            );
         });
         ui.horizontal(|ui| {
             ui.label("Бэкенд:");
@@ -343,6 +389,7 @@ impl GuiApp {
             })
             .unwrap_or_default();
         egui::ScrollArea::vertical()
+            .id_salt("history")
             .max_height(220.0)
             .show(ui, |ui| {
                 if entries.is_empty() {
@@ -351,7 +398,7 @@ impl GuiApp {
                 for (when, text) in entries {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(when).weak().small());
-                        if ui.small_button("📋").clicked() {
+                        if ui.small_button("Копия").clicked() {
                             if let Ok(mut cb) = arboard::Clipboard::new() {
                                 let _ = cb.set_text(text.clone());
                             }
@@ -367,6 +414,7 @@ impl GuiApp {
         ui.heading("Лог");
         let lines = self.state.recent_log();
         egui::ScrollArea::vertical()
+            .id_salt("log")
             .max_height(140.0)
             .show(ui, |ui| {
                 for line in lines.iter().rev().take(60) {
@@ -396,7 +444,7 @@ impl GuiApp {
                 ui.vertical_centered(|ui| {
                     let secs = self.state.recording_secs();
                     ui.label(
-                        egui::RichText::new(format!("● {secs} c — говорите…"))
+                        egui::RichText::new(format!("[{secs} c] говорите…"))
                             .color(egui::Color32::from_rgb(230, 70, 70))
                             .size(22.0)
                             .strong(),
@@ -428,7 +476,7 @@ impl eframe::App for GuiApp {
             self.save_history();
         }
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("main").show(ui, |ui| {
             self.show_status(ui);
             ui.add_space(8.0);
             self.show_settings(ui);
@@ -456,13 +504,19 @@ pub(crate) fn whisper_available() -> bool {
 }
 
 /// Build the tray icon + menu. The returned `GuiApp` owns the tray handle.
-fn build_tray() -> (Option<TrayIcon>, MenuItem, MenuItem) {
+fn build_tray() -> (Option<TrayIcon>, MenuItem, MenuItem, MenuItem) {
     let show_item = MenuItem::new("Показать", true, None);
+    let pause_item = MenuItem::new("Пауза", true, None);
     let quit_item = MenuItem::new("Выход", true, None);
     let menu = Menu::new();
     let tray = (|| -> Option<TrayIcon> {
-        menu.append_items(&[&show_item, &PredefinedMenuItem::separator(), &quit_item])
-            .ok()?;
+        menu.append_items(&[
+            &show_item,
+            &pause_item,
+            &PredefinedMenuItem::separator(),
+            &quit_item,
+        ])
+        .ok()?;
         TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_tooltip("flowvoice — диктовка")
@@ -473,7 +527,7 @@ fn build_tray() -> (Option<TrayIcon>, MenuItem, MenuItem) {
     if tray.is_none() {
         eprintln!("[gui] tray unavailable, window-only mode");
     }
-    (tray, show_item, quit_item)
+    (tray, show_item, pause_item, quit_item)
 }
 
 /// Entry point for `--gui`: hook thread + preload + tray + event loop.
@@ -531,7 +585,7 @@ pub fn run() {
         *pref = settings.backend;
     }
 
-    let (tray, show_item, quit_item) = build_tray();
+    let (tray, show_item, pause_item, quit_item) = build_tray();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -555,6 +609,7 @@ pub fn run() {
                 status_line: String::new(),
                 tray,
                 show_item,
+                pause_item,
                 quit_item,
                 quit_requested: false,
                 icon_recording: false,

@@ -143,8 +143,10 @@ pub fn ensure_server() -> Result<u16, String> {
     }
 }
 
-/// Send 16 kHz mono i16 PCM to `/inference`, return the raw transcript.
-pub fn transcribe_pcm(pcm: &[i16]) -> Result<String, String> {
+/// Send 16 kHz mono i16 PCM to `/inference`, return raw per-segment texts.
+/// `verbose_json` segments track sentence boundaries, so callers can
+/// punctuate every sentence instead of only terminating the whole utterance.
+pub fn transcribe_pcm(pcm: &[i16]) -> Result<Vec<String>, String> {
     let p = ensure_server()?;
     let wav = encode_wav(pcm);
     let boundary = format!("----flowvoice{}", std::process::id());
@@ -211,7 +213,7 @@ fn encode_multipart(boundary: &str, wav: &[u8]) -> Vec<u8> {
     );
     body.extend_from_slice(wav);
     body.extend_from_slice(b"\r\n");
-    for (name, value) in [("temperature", "0.0"), ("response_format", "json")] {
+    for (name, value) in [("temperature", "0.0"), ("response_format", "verbose_json")] {
         part(
             &mut body,
             &format!("Content-Disposition: form-data; name=\"{name}\""),
@@ -223,8 +225,10 @@ fn encode_multipart(boundary: &str, wav: &[u8]) -> Vec<u8> {
     body
 }
 
-/// Pull the transcript out of an `/inference` HTTP reply (`{"text": ...}`).
-fn parse_inference_response(resp: &[u8]) -> Result<String, String> {
+/// Pull per-segment transcripts out of an `/inference` HTTP reply.
+/// Prefers the `verbose_json` `segments[]` array (one entry per sentence);
+/// falls back to the top-level `text` when segments are absent.
+fn parse_inference_response(resp: &[u8]) -> Result<Vec<String>, String> {
     let split = resp
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -242,11 +246,36 @@ fn parse_inference_response(resp: &[u8]) -> Result<String, String> {
     }
     let value: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| format!("bad whisper json: {e}"))?;
-    value
-        .get("text")
-        .and_then(|t| t.as_str())
-        .map(|s| s.trim().to_string())
-        .ok_or_else(|| "whisper-server reply has no text".to_string())
+    let texts = segment_texts(&value);
+    if texts.is_empty() {
+        return Err("whisper-server reply has no text".to_string());
+    }
+    Ok(texts)
+}
+
+/// Split a `verbose_json`-style reply into trimmed non-empty segment texts.
+/// Shared with the Groq backend (same response shape).
+pub(crate) fn segment_texts(value: &serde_json::Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(segments) = value.get("segments").and_then(|s| s.as_array()) {
+        for seg in segments {
+            if let Some(t) = seg.get("text").and_then(|t| t.as_str()) {
+                let t = t.trim().to_string();
+                if !t.is_empty() {
+                    out.push(t);
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        if let Some(t) = value.get("text").and_then(|t| t.as_str()) {
+            let t = t.trim().to_string();
+            if !t.is_empty() {
+                out.push(t);
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -278,7 +307,7 @@ mod tests {
         assert!(text.contains("filename=\"utterance.wav\""));
         assert!(text.contains("name=\"temperature\""));
         assert!(text.contains("name=\"response_format\""));
-        assert!(text.contains("json"));
+        assert!(text.contains("verbose_json"));
         assert!(text.ends_with("--BND--\r\n"));
         assert!(body.windows(3).any(|w| w == [1, 2, 3]));
     }
@@ -286,7 +315,13 @@ mod tests {
     #[test]
     fn parses_json_text_reply() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 26\r\n\r\n{\"text\":\"  \xd0\x9f\xd1\x80\xd0\xb8\xd0\xb2\xd0\xb5\xd1\x82 \"}";
-        assert_eq!(parse_inference_response(raw).unwrap(), "Привет");
+        assert_eq!(parse_inference_response(raw).unwrap(), ["Привет"]);
+    }
+
+    #[test]
+    fn prefers_verbose_segments() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"text\":\"a b\",\"segments\":[{\"text\":\"  a. \"},{\"text\":\"\"},{\"text\":\"b?\"}]}";
+        assert_eq!(parse_inference_response(raw).unwrap(), ["a.", "b?"]);
     }
 
     #[test]

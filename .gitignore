@@ -7,5 +7,6 @@
 /native/libstdc++-6.dll
 /native/libwinpthread-1.dll
 *.log
+start-gui.log
 .idea/
 .vscode/

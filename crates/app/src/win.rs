@@ -66,10 +66,22 @@ struct Point {
 static HOTKEY: AtomicU16 = AtomicU16::new(VK_RCONTROL);
 static RECORDING: AtomicBool = AtomicBool::new(false);
 static STOP: AtomicBool = AtomicBool::new(false);
+/// Master switch for dictation (GUI pause button / tray). When off, hotkey
+/// presses are ignored entirely; an in-flight recording finishes normally.
+static ENABLED: AtomicBool = AtomicBool::new(true);
 
 /// Change the hotkey at runtime (GUI settings). Takes effect immediately.
 pub fn set_hotkey_vk(vk: u16) {
     HOTKEY.store(vk, Ordering::SeqCst);
+}
+
+/// Pause (`false`) or resume (`true`) dictation without touching the UI.
+pub fn set_enabled(on: bool) {
+    ENABLED.store(on, Ordering::SeqCst);
+}
+
+pub fn is_enabled() -> bool {
+    ENABLED.load(Ordering::SeqCst)
 }
 
 #[cfg(feature = "audio")]
@@ -78,7 +90,7 @@ pub fn is_stop_requested() -> bool {
 }
 
 extern "system" fn hook_proc(code: c_int, w_param: usize, l_param: isize) -> isize {
-    if code >= 0 {
+    if code >= 0 && ENABLED.load(Ordering::SeqCst) {
         // KBDLLHOOKSTRUCT starts with vkCode: u32, scanCode: u32, ...
         let vk = unsafe { *(l_param as *const u32) } as u16;
         let hotkey = HOTKEY.load(Ordering::SeqCst);
