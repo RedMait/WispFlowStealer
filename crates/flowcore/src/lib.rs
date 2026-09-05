@@ -207,6 +207,154 @@ fn collapse_repeats(words: &[String]) -> Vec<String> {
     out
 }
 
+/// Phrases that take a trailing comma when the sentence continues
+/// (`например` -> `например,`). Ordered longest-first per language.
+fn comma_after_phrases(lang: Language) -> &'static [&'static [&'static str]] {
+    match lang {
+        Language::Ru => &[
+            &["конечно", "же"],
+            &["честно", "говоря"],
+            &["иными", "словами"],
+            &["между", "прочим"],
+            &["тем", "не", "менее"],
+            &["к", "сожалению"],
+            &["к", "счастью"],
+            &["например"],
+            &["конечно"],
+            &["наверное"],
+            &["пожалуй"],
+            &["видимо"],
+            &["кажется"],
+            &["по-моему"],
+            &["во-первых"],
+            &["во-вторых"],
+            &["в-третьих"],
+            &["итак"],
+            &["впрочем"],
+        ],
+        Language::En => &[
+            &["however"],
+            &["therefore"],
+            &["anyway"],
+            &["meanwhile"],
+            &["finally"],
+            &["obviously"],
+            &["apparently"],
+            &["unfortunately"],
+            &["fortunately"],
+            &["besides"],
+            &["moreover"],
+        ],
+    }
+}
+
+/// Phrases that take a leading comma when they begin a subordinate clause
+/// (`я подумал что ...` -> `я подумал, что ...`). Matched only mid-sentence.
+fn comma_before_phrases(lang: Language) -> &'static [&'static [&'static str]] {
+    match lang {
+        Language::Ru => &[
+            &["потому", "что"],
+            &["так", "как"],
+            &["что"],
+            &["чтобы"],
+            &["если"],
+            &["хотя"],
+            &["но"],
+            &["поэтому"],
+            &["который"],
+            &["которая"],
+            &["которое"],
+            &["которые"],
+            &["чей"],
+            &["чья"],
+            &["чьи"],
+        ],
+        Language::En => &[
+            &["because"],
+            &["though"],
+            &["although"],
+            &["while"],
+            &["so"],
+            &["yet"],
+            &["but"],
+        ],
+    }
+}
+
+/// Insert heuristic commas into the token stream, leaving explicit
+/// punctuation untouched. Kept deliberately conservative to avoid
+/// embarrassing errors in dictation output.
+fn insert_commas(tokens: &[Token], lang: Language) -> Vec<Token> {
+    let mut after: Vec<&[&str]> = comma_after_phrases(lang).to_vec();
+    let mut before: Vec<&[&str]> = comma_before_phrases(lang).to_vec();
+    after.sort_by_key(|p| std::cmp::Reverse(p.len()));
+    before.sort_by_key(|p| std::cmp::Reverse(p.len()));
+
+    fn phrase_len(tokens: &[Token], i: usize, phrases: &[&[&str]]) -> Option<usize> {
+        'outer: for p in phrases {
+            if i + p.len() <= tokens.len() {
+                for (k, pw) in p.iter().enumerate() {
+                    match &tokens[i + k] {
+                        Token::Word(w) if w.eq_ignore_ascii_case(pw) => {}
+                        _ => continue 'outer,
+                    }
+                }
+                return Some(p.len());
+            }
+        }
+        None
+    }
+
+    let mut out: Vec<Token> = Vec::new();
+    let mut i = 0usize;
+    while i < tokens.len() {
+        match &tokens[i] {
+            Token::Punct(c) => {
+                out.push(Token::Punct(*c));
+                i += 1;
+            }
+            Token::Word(_) => {
+                if let Some(len) = phrase_len(tokens, i, &before) {
+                    let sentence_open = !out.iter().any(|t| matches!(t, Token::Word(_)));
+                    if !sentence_open && !matches!(out.last(), Some(Token::Punct(_))) {
+                        out.push(Token::Punct(','));
+                    }
+                    for w in tokens.iter().skip(i).take(len) {
+                        if let Token::Word(w) = w {
+                            out.push(Token::Word(w.clone()));
+                        }
+                    }
+                    i += len;
+                    continue;
+                }
+                if let Some(len) = phrase_len(tokens, i, &after) {
+                    let prev_word = out.iter().any(|t| matches!(t, Token::Word(_)));
+                    if prev_word && !matches!(out.last(), Some(Token::Punct(_))) {
+                        out.push(Token::Punct(','));
+                    }
+                    for w in tokens.iter().skip(i).take(len) {
+                        if let Token::Word(w) = w {
+                            out.push(Token::Word(w.clone()));
+                        }
+                    }
+                    if matches!(tokens.get(i + len), Some(Token::Word(_)))
+                        && !matches!(out.last(), Some(Token::Punct(_)))
+                    {
+                        out.push(Token::Punct(','));
+                    }
+                    i += len;
+                    continue;
+                }
+                if let Token::Word(w) = &tokens[i] {
+                    out.push(Token::Word(w.clone()));
+                }
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 /// Returns an explicit terminal punctuation mark if the raw text already
 /// ends with one of `?`, `!` or `.`.
 fn raw_terminal(raw: &str) -> Option<char> {
@@ -445,7 +593,7 @@ pub fn format(raw: &str, lang: Language) -> String {
         }
     }
 
-    let mut text = join_tokens(&rebuilt, lang);
+    let mut text = join_tokens(&insert_commas(&rebuilt, lang), lang);
     if text.is_empty() {
         return String::new();
     }
@@ -457,6 +605,40 @@ pub fn format(raw: &str, lang: Language) -> String {
         text.push_str(term);
     }
     text
+}
+
+/// Reduce raw dictation to a bare lowercase word sequence: fillers removed,
+/// repeats collapsed, no punctuation and no casing. This is the right input
+/// shape for downstream neural post-processors (e.g. punctuation models).
+pub fn clean(raw: &str, lang: Language) -> String {
+    let tokens = tokenize(raw.trim());
+    let lower: Vec<String> = tokens
+        .iter()
+        .filter_map(|t| match t {
+            Token::Word(w) => Some(w.to_lowercase()),
+            Token::Punct(_) => None,
+        })
+        .collect();
+    let mask = filler_mask(&lower, lang);
+
+    let mut words: Vec<String> = Vec::new();
+    let mut mi = 0usize;
+    for token in &tokens {
+        if let Token::Word(w) = token {
+            mi += 1;
+            if !mask[mi - 1] {
+                continue;
+            }
+            let lower = w.to_lowercase();
+            if let Some(last) = words.last() {
+                if last == &lower {
+                    continue;
+                }
+            }
+            words.push(lower);
+        }
+    }
+    words.join(" ")
 }
 
 /// Convenience wrapper around [`format`] that auto-detects the language.

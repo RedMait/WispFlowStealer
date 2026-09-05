@@ -112,9 +112,51 @@ fn explicit_punctuation_wins() {
 fn commas_are_kept_and_spaced_correctly() {
     assert_eq!(
         ru("ну и я тут подумал ну что делать"),
-        "Я тут подумал что делать."
+        "Я тут подумал, что делать."
     );
     assert_eq!(ru("привет , мир"), "Привет, мир.");
+}
+
+#[test]
+fn heuristic_commas_ru() {
+    assert_eq!(ru("я подумал ну что делать"), "Я подумал, что делать.");
+    assert_eq!(
+        ru("я хочу пойти домой потому что устал"),
+        "Я хочу пойти домой, потому что устал."
+    );
+    assert_eq!(
+        ru("это невозможно например в такую погоду"),
+        "Это невозможно, например, в такую погоду."
+    );
+    assert_eq!(ru("приходи когда хочешь"), "Приходи когда хочешь.");
+    assert_eq!(ru("конечно же можно"), "Конечно же, можно.");
+    assert_eq!(ru("но я всё равно пойду"), "Но я всё равно пойду.");
+    assert_eq!(
+        ru("я знаю человека который всё понимает"),
+        "Я знаю человека, который всё понимает."
+    );
+}
+
+#[test]
+fn heuristic_commas_en() {
+    assert_eq!(
+        en("i stayed home because it rained"),
+        "I stayed home, because it rained."
+    );
+    assert_eq!(en("it depends on who asks"), "It depends on who asks.");
+    assert_eq!(en("but i will still go"), "But I will still go.");
+}
+
+#[test]
+fn clean_returns_bare_lowercase_words() {
+    assert_eq!(
+        flowcore::clean("Ну привет мир! Это типа классно", Language::Ru),
+        "привет мир это классно"
+    );
+    assert_eq!(
+        flowcore::clean("um hello world. wow", Language::En),
+        "hello world wow"
+    );
 }
 
 #[test]

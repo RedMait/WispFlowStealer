@@ -9,6 +9,7 @@ description = "Hold-to-talk voice dictation with auto-formatting"
 
 [dependencies]
 flowcore = { path = "../flowcore" }
+flowpunct = { path = "../punct", optional = true, features = ["onnx"] }
 
 cpal = { version = "0.15", optional = true }
 vosk = { version = "0.3", optional = true }
@@ -17,5 +18,6 @@ arboard = { version = "3.4", optional = true }
 [features]
 default = []
 # Full dictation pipeline: microphone capture + local speech-to-text + clipboard.
+# Adds the ML punctuation module, so the audio build also compiles `tract`.
 # Native speech libs make this Windows-friendly; build it locally for the demo.
-audio = ["dep:cpal", "dep:vosk", "dep:arboard"]
+audio = ["dep:cpal", "dep:vosk", "dep:arboard", "dep:flowpunct"]

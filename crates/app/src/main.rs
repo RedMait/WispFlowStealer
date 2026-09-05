@@ -78,6 +78,7 @@ fn print_help() {
     println!();
     println!("ENV:");
     println!("  FLOWVOICE_MODEL    path to a Vosk model directory (default models/ru)");
+    println!("  FLOWPUNCT_MODEL    dir with rupunct_small_int8.onnx + tokenizer.json (default models/punct)");
     println!();
     println!("DEFAULT HOTKEY: hold Right Ctrl to dictate, release to insert formatted text");
 }

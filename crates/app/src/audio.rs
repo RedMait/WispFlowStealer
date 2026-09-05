@@ -6,7 +6,12 @@
 //! 16 kHz -> feed the Vosk recognizer -> return the recognized text.
 
 use cpal::traits::DeviceTrait;
+use flowcore::Language;
+use flowpunct::Punctuator;
 use vosk::{CompleteResult, Model, Recognizer};
+
+use std::path::PathBuf;
+use std::sync::OnceLock;
 
 const TARGET_SAMPLE_RATE: u32 = 16_000;
 
@@ -14,6 +19,49 @@ const TARGET_SAMPLE_RATE: u32 = 16_000;
 /// Defaults to `models/ru` because the Russian dictation demo needs it.
 fn default_model_path() -> String {
     std::env::var("FLOWVOICE_MODEL").unwrap_or_else(|_| "models/ru".to_string())
+}
+
+/// Directory holding the RUPunct punctuation model, or `None` when absent.
+/// Override via the `FLOWPUNCT_MODEL` env var.
+fn punct_dir() -> PathBuf {
+    std::env::var_os("FLOWPUNCT_MODEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|cwd| cwd.join("models").join("punct"))
+                .unwrap_or_else(|_| PathBuf::from("models/punct"))
+        })
+}
+
+/// Lazily load the neural punctuator; `None` when the model is not installed.
+fn punct_instance() -> Option<&'static Punctuator> {
+    static PUNCT: OnceLock<Option<Punctuator>> = OnceLock::new();
+    PUNCT
+        .get_or_init(|| {
+            let dir = punct_dir();
+            let onnx = dir.join("rupunct_small_int8.onnx");
+            let tokenizer = dir.join("tokenizer.json");
+            if !onnx.exists() || !tokenizer.exists() {
+                return None;
+            }
+            Punctuator::load(&onnx.to_string_lossy(), &tokenizer.to_string_lossy()).ok()
+        })
+        .as_ref()
+}
+
+/// Post-process the raw transcript: neural punctuation for Russian when the
+/// model is installed, otherwise the deterministic heuristic pipeline.
+fn finalize(text: String) -> String {
+    let lang = Language::detect(&text);
+    if lang == Language::Ru {
+        if let Some(punct) = punct_instance() {
+            let cleaned = flowcore::clean(&text, lang);
+            return punct
+                .punct(&cleaned)
+                .unwrap_or_else(|_| flowcore::format(&text, lang));
+        }
+    }
+    flowcore::format(&text, lang)
 }
 
 /// Capture until the hotkey is released, recognize, return the transcript.
@@ -33,7 +81,7 @@ pub fn transcribe() -> Result<String, String> {
     }
 
     let completed = recognizer.final_result();
-    Ok(transcript(&completed))
+    Ok(finalize(transcript(&completed)))
 }
 
 fn transcript(result: &CompleteResult<'_>) -> String {
