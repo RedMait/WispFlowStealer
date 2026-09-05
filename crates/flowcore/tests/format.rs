@@ -167,12 +167,27 @@ fn conjunction_a_survives_and_punct_glues() {
         ru("тоже хочу чаю, а также пирожок"),
         "Тоже хочу чаю, а также пирожок."
     );
-    // Back-to-back punctuation from the recognizer stays glued.
-    assert_eq!(ru("привет., мир"), "Привет., мир.");
+    // Back-to-back punctuation from the recognizer: period wins, next
+    // sentence gets its capital.
+    assert_eq!(ru("привет., мир"), "Привет. Мир.");
     assert_eq!(
         ru("выручка выросла на 12%, но упала"),
         "Выручка выросла на 12%, но упала."
     );
+}
+
+#[test]
+fn adjacent_marks_collapse_and_sentences_case() {
+    // Recognizer glitches: comma+period stuck together.
+    assert_eq!(ru("все готово., жду звонка"), "Все готово. Жду звонка.");
+    assert_eq!(ru("все готово,. жду звонка"), "Все готово. Жду звонка.");
+    assert_eq!(ru("привет,, мир"), "Привет, мир.");
+    assert_eq!(ru("да!? серьезно"), "Да?! Серьезно.");
+    // Internal sentence boundary gets its capital.
+    assert_eq!(ru("все готово. жду звонка"), "Все готово. Жду звонка.");
+    // Ellipsis and decimal numbers survive.
+    assert_eq!(ru("ждал... и вот"), "Ждал... И вот.");
+    assert_eq!(ru("версия 3.14 вышла"), "Версия 3.14 вышла.");
 }
 
 #[test]

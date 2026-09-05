@@ -1,4 +1,4 @@
-﻿//! Windows-only implementation of the hold-to-talk UX using raw WinAPI.
+//! Windows-only implementation of the hold-to-talk UX using raw WinAPI.
 //!
 //! A low-level keyboard hook (`WH_KEYBOARD_LL`) detects when the hotkey is
 //! pressed down and released. On press a recorder thread starts; on release
@@ -46,6 +46,20 @@ unsafe extern "system" {
     fn keybd_event(b_vk: u8, b_scan: u8, dw_flags: u32, dw_extra: usize);
 }
 
+#[cfg(feature = "gui")]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetConsoleWindow() -> *const c_void;
+    fn AttachConsole(process_id: u32) -> c_int;
+    fn AllocConsole() -> c_int;
+}
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    #[cfg(feature = "gui")]
+    fn MessageBoxW(hwnd: *const c_void, text: *const u16, caption: *const u16, kind: u32) -> c_int;
+}
+
 #[repr(C)]
 struct Msg {
     hwnd: *const c_void,
@@ -69,6 +83,8 @@ static STOP: AtomicBool = AtomicBool::new(false);
 /// Master switch for dictation (GUI pause button / tray). When off, hotkey
 /// presses are ignored entirely; an in-flight recording finishes normally.
 static ENABLED: AtomicBool = AtomicBool::new(true);
+/// When the hotkey was last released: start of the release→paste latency.
+static KEYUP_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
 /// Change the hotkey at runtime (GUI settings). Takes effect immediately.
 pub fn set_hotkey_vk(vk: u16) {
@@ -76,12 +92,46 @@ pub fn set_hotkey_vk(vk: u16) {
 }
 
 /// Pause (`false`) or resume (`true`) dictation without touching the UI.
+#[cfg(feature = "gui")]
 pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::SeqCst);
 }
 
+#[cfg(feature = "gui")]
 pub fn is_enabled() -> bool {
     ENABLED.load(Ordering::SeqCst)
+}
+
+/// Make sure terminal modes have somewhere to print.
+///
+/// GUI builds are windowed (`windows_subsystem`), so a double-clicked exe
+/// has no console at all. When started from a terminal we attach to the
+/// parent console; otherwise a fresh one is allocated.
+#[cfg(feature = "gui")]
+pub fn ensure_console() {
+    const ATTACH_PARENT: u32 = 0xFFFFFFFF;
+    unsafe {
+        if !GetConsoleWindow().is_null() {
+            return;
+        }
+        if AttachConsole(ATTACH_PARENT) == 0 {
+            AllocConsole();
+        }
+    }
+}
+
+/// Last-resort error popup for GUI startup failures (no console to print
+/// to in windowed mode).
+#[cfg(feature = "gui")]
+pub fn fatal_popup(text: &str) {
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+    let text = wide(text);
+    let caption = wide("flowvoice");
+    unsafe {
+        MessageBoxW(std::ptr::null(), text.as_ptr(), caption.as_ptr(), 0x10);
+    }
 }
 
 #[cfg(feature = "audio")]
@@ -111,18 +161,25 @@ extern "system" fn hook_proc(code: c_int, w_param: usize, l_param: isize) -> isi
 
 fn handle_keydown() {
     STOP.store(false, Ordering::SeqCst);
-    println!("[listening] hold the key and speak...");
-    let _ = std::io::stdout().flush();
+    #[cfg(any(feature = "audio", feature = "gui"))]
+    state::emit("[listening] hold the key and speak...");
+    #[cfg(not(any(feature = "audio", feature = "gui")))]
+    {
+        println!("[listening] hold the key and speak...");
+        let _ = std::io::stdout().flush();
+    }
     #[cfg(any(feature = "audio", feature = "gui"))]
     if let Some(s) = state::get() {
         s.set_recording(true);
-        s.push_log("[listening] hold the key and speak...".to_string());
     }
     std::thread::spawn(spawn_recorder);
 }
 
 fn handle_keyup() {
     STOP.store(true, Ordering::SeqCst);
+    if let Ok(mut slot) = KEYUP_AT.lock() {
+        *slot = Some(std::time::Instant::now());
+    }
 }
 
 fn spawn_recorder() {
@@ -144,10 +201,9 @@ fn spawn_recorder() {
         match crate::audio::transcribe() {
             Ok(text) => finish_with(text, shared),
             Err(e) => {
-                eprintln!("[error] {e}");
+                state::emit(&format!("[error] {e}"));
                 if let Some(s) = &shared {
                     s.set_recording(false);
-                    s.push_log(format!("[error] {e}"));
                 }
             }
         }
@@ -167,15 +223,11 @@ fn spawn_recorder() {
 /// when available, heuristic formatting otherwise) — paste it as-is.
 fn finish(text: &str) {
     if text.is_empty() {
-        println!("[done] no speech detected");
+        state::emit("[done] no speech detected");
         return;
     }
 
-    println!("[final] {text}");
-    let _ = std::io::stdout().flush();
-    if let Some(s) = state::get() {
-        s.push_log(format!("[final] {text}"));
-    }
+    state::emit(&format!("[final] {text}"));
     paste(text);
 }
 
@@ -188,12 +240,12 @@ fn paste(text: &str) {
         let mut cb = match arboard::Clipboard::new() {
             Ok(cb) => cb,
             Err(e) => {
-                eprintln!("[error] cannot open clipboard: {e}");
+                state::emit(&format!("[error] cannot open clipboard: {e}"));
                 return;
             }
         };
         if let Err(e) = cb.set_text(text) {
-            eprintln!("[error] cannot write clipboard: {e}");
+            state::emit(&format!("[error] cannot write clipboard: {e}"));
             return;
         }
     }
@@ -203,6 +255,16 @@ fn paste(text: &str) {
         keybd_event(VK_V as u8, 0, 0, 0);
         keybd_event(VK_V as u8, 0, KEYEVENTF_KEYUP, 0);
         keybd_event(VK_CONTROL as u8, 0, KEYEVENTF_KEYUP, 0);
+    }
+
+    // Latency from hotkey release to the finished paste, straight to the log.
+    if let Ok(mut slot) = KEYUP_AT.lock() {
+        if let Some(t0) = slot.take() {
+            state::emit(&format!(
+                "[timing] {:.1}s keyup->paste",
+                t0.elapsed().as_secs_f32()
+            ));
+        }
     }
 }
 

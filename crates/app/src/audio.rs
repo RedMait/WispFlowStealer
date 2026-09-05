@@ -46,24 +46,26 @@ pub fn preload() {
     std::thread::spawn(|| {
         let pref = pref();
         if pref.allows_groq() && crate::groq::available() {
-            println!("[ready] groq backend (cloud whisper)");
+            crate::state::emit("[ready] groq backend (cloud whisper)");
             set_label("groq cloud");
         } else if pref.allows_local() && crate::whisper::available() {
             match crate::whisper::ensure_server() {
                 Ok(p) => {
-                    println!("[ready] whisper server on 127.0.0.1:{p}");
+                    crate::state::emit(&format!("[ready] whisper server on 127.0.0.1:{p}"));
                     set_label("whisper local");
                 }
-                Err(e) => eprintln!("[whisper] {e} (vosk fallback)"),
+                Err(e) => crate::state::emit(&format!("[whisper] {e} (vosk fallback)")),
             }
         } else if pref.allows_vosk() && model_instance().is_ok() {
-            println!("[ready] speech model loaded (vosk fallback)");
+            crate::state::emit("[ready] speech model loaded (vosk fallback)");
             set_label("vosk");
         } else {
-            eprintln!("[audio] no speech backend: set GROQ_API_KEY or run scripts/get-native.ps1");
+            crate::state::emit(
+                "[audio] no speech backend: set GROQ_API_KEY or run scripts/get-native.ps1",
+            );
         }
         if punct_instance().is_some() {
-            println!("[ready] punctuation model loaded");
+            crate::state::emit("[ready] punctuation model loaded");
         }
     });
 }
@@ -159,7 +161,10 @@ pub fn transcribe() -> Result<String, String> {
     if pref.allows_vosk() {
         let model = model_instance()?;
         set_label("vosk");
-        return Ok(finalize(recognize_with(model, &pcm16k)?));
+        // The neural punctuator may glue marks across words; collapse runs.
+        return Ok(flowcore::collapse_punctuation(&finalize(recognize_with(
+            model, &pcm16k,
+        )?)));
     }
 
     Err("no speech backend enabled: set GROQ_API_KEY or run scripts/get-native.ps1".to_string())

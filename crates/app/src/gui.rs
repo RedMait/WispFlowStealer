@@ -50,7 +50,7 @@ fn load_settings() -> Settings {
             }
         }
         if let Some(l) = v.get("lang").and_then(|x| x.as_str()) {
-            if !l.is_empty() {
+            if matches!(l, "ru" | "en" | "auto") {
                 s.lang = l.to_string();
             }
         }
@@ -322,17 +322,19 @@ impl GuiApp {
         });
         ui.horizontal(|ui| {
             ui.label("Язык:");
-            ui.add_sized(
-                [60.0, 22.0],
-                egui::TextEdit::singleline(&mut self.settings.lang),
+            egui::ComboBox::from_id_salt("lang")
+                .selected_text(self.settings.lang.clone())
+                .show_ui(ui, |ui| {
+                    for name in ["ru", "en", "auto"] {
+                        ui.selectable_value(&mut self.settings.lang, name.to_string(), name);
+                    }
+                });
+            ui.label(
+                egui::RichText::new("auto — определять автоматически")
+                    .weak()
+                    .small(),
             );
-            ui.label(egui::RichText::new("ru / en").weak().small());
         });
-        ui.label(
-            egui::RichText::new("auto — только локальный движок")
-                .weak()
-                .small(),
-        );
         ui.horizontal(|ui| {
             ui.label("Groq-модель:");
             ui.add_sized(
@@ -525,7 +527,7 @@ fn build_tray() -> (Option<TrayIcon>, MenuItem, MenuItem, MenuItem) {
             .ok()
     })();
     if tray.is_none() {
-        eprintln!("[gui] tray unavailable, window-only mode");
+        crate::state::emit("[gui] tray unavailable, window-only mode");
     }
     (tray, show_item, pause_item, quit_item)
 }
@@ -560,7 +562,7 @@ pub fn run() {
     let mut settings = load_settings();
     // Env overrides the file for these two (same rule as console mode).
     if let Ok(lang) = std::env::var("FLOWVOICE_LANG") {
-        if !lang.is_empty() {
+        if matches!(lang.as_str(), "ru" | "en" | "auto") {
             settings.lang = lang;
         }
     }
@@ -616,7 +618,9 @@ pub fn run() {
             }) as Box<dyn eframe::App>)
         }),
     ) {
-        eprintln!("[gui] event loop failed: {e}");
+        // Popup first: stderr may be invalid in windowed mode, so a print
+        // here could panic and hide the message.
+        crate::win::fatal_popup(&format!("[gui] event loop failed: {e}"));
         std::process::exit(1);
     }
 }

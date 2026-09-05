@@ -1,3 +1,8 @@
+// GUI builds are windowed apps: double-clicking the exe opens no console.
+// Terminal modes (--help/--demo/console hook) reattach explicitly via
+// `win::ensure_console()`.
+#![cfg_attr(all(windows, feature = "gui"), windows_subsystem = "windows")]
+
 mod demo;
 
 #[cfg(all(windows, feature = "audio"))]
@@ -18,15 +23,27 @@ mod state;
 #[cfg(all(windows, feature = "gui"))]
 mod gui;
 
+/// Console builds always have a terminal; windowed GUI builds reattach
+/// explicitly for terminal modes.
+#[cfg(all(windows, feature = "gui"))]
+fn ensure_console() {
+    win::ensure_console();
+}
+
+#[cfg(not(all(windows, feature = "gui")))]
+fn ensure_console() {}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     if args.iter().any(|a| a == "-h" || a == "--help") {
+        ensure_console();
         print_help();
         return;
     }
 
     if let Some(text) = parse_demo_arg(&args) {
+        ensure_console();
         demo::run(&text);
         return;
     }
@@ -34,6 +51,7 @@ fn main() {
     if args.iter().any(|a| a == "--gui") {
         #[cfg(all(windows, feature = "gui"))]
         {
+            // Windowed on purpose: no console in GUI mode.
             gui::run();
             return;
         }
@@ -48,6 +66,7 @@ fn main() {
 
     #[cfg(windows)]
     {
+        ensure_console();
         let key = parse_key_arg(&args).unwrap_or_default();
         win::run(key);
     }

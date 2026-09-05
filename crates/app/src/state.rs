@@ -224,3 +224,16 @@ pub fn attach(state: Arc<AppState>) {
 pub fn get() -> Option<Arc<AppState>> {
     STATE.get().cloned()
 }
+
+/// Emit a status line: GUI log panel when attached, stdout otherwise.
+///
+/// Windowed GUI builds may have no valid stdout at all (double-clicked
+/// exe), where `println!` would panic — so GUI-attached code must use
+/// this instead of printing directly.
+pub fn emit(line: &str) {
+    if let Some(s) = get() {
+        s.push_log(line.to_string());
+    } else {
+        println!("{line}");
+    }
+}

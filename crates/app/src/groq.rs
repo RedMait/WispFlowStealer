@@ -82,8 +82,13 @@ fn clip_prompt(full: &str) -> String {
 
 /// Upload one wav file with curl.exe, extract `{"text": ...}`.
 fn post_wav(path: &std::path::Path, key: &str) -> Result<Vec<String>, String> {
+    use std::os::windows::process::CommandExt as _;
+
     let file_arg = format!("file=@{};type=audio/wav", path.display());
     let mut cmd = Command::new("curl.exe");
+    // Console child of a windowless parent would flash a terminal and
+    // steal focus (breaking the Ctrl+V paste that follows).
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     cmd.arg("-sS")
         .arg("--max-time")
         .arg("180")
@@ -95,10 +100,13 @@ fn post_wav(path: &std::path::Path, key: &str) -> Result<Vec<String>, String> {
         .arg("-F")
         .arg(file_arg)
         .arg("-F")
-        .arg(format!("model={}", model()))
-        .arg("-F")
-        .arg(format!("language={}", crate::whisper::lang()))
-        .arg("-F")
+        .arg(format!("model={}", model()));
+    // No "auto" code on the API side: omitting the field enables detection.
+    if crate::whisper::lang() != "auto" {
+        cmd.arg("-F")
+            .arg(format!("language={}", crate::whisper::lang()));
+    }
+    cmd.arg("-F")
         .arg("response_format=verbose_json")
         .arg("-F")
         .arg("temperature=0.0");
@@ -107,7 +115,7 @@ fn post_wav(path: &std::path::Path, key: &str) -> Result<Vec<String>, String> {
             .map(|v| v.chars().count())
             .unwrap_or(0);
         if full_len > prompt().chars().count() {
-            eprintln!("[groq] prompt clipped to fit the 896-char limit");
+            crate::state::emit("[groq] prompt clipped to fit the 896-char limit");
         }
         cmd.arg("-F").arg(format!("prompt={}", prompt()));
     }

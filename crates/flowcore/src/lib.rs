@@ -506,13 +506,35 @@ pub fn classify(raw: &str, lang: Language) -> SentenceKind {
 
 /// Join tokens back into a single string with sane spacing rules.
 fn join_tokens(tokens: &[Token], lang: Language) -> String {
+    // A dot/comma between digits is a decimal separator, not a boundary:
+    // glue it tight (`3 . 14` -> `3.14`).
+    fn decimal_glue(tokens: &[Token], i: usize, c: char) -> bool {
+        if !(c == '.' || c == ',') {
+            return false;
+        }
+        let prev_digit = tokens[..i].iter().rev().find_map(|t| match t {
+            Token::Word(w) => w.chars().last(),
+            Token::Punct(p) => Some(*p),
+        });
+        let next_digit = tokens.get(i + 1).and_then(|t| match t {
+            Token::Word(w) => w.chars().next(),
+            Token::Punct(_) => None,
+        });
+        matches!(prev_digit, Some(d) if d.is_ascii_digit())
+            && matches!(next_digit, Some(d) if d.is_ascii_digit())
+    }
+
     let mut s = String::new();
-    for token in tokens {
+    // Set when the previous mark was glued decimal-tight (`3.` so far):
+    // the next word continues the number without a space.
+    let mut glued = false;
+    for (i, token) in tokens.iter().enumerate() {
         match token {
             Token::Word(w) => {
-                if !s.is_empty() && !s.ends_with(char::is_whitespace) {
+                if !s.is_empty() && !s.ends_with(char::is_whitespace) && !glued {
                     s.push(' ');
                 }
+                glued = false;
                 let word = if lang == Language::En && w.eq_ignore_ascii_case("i") {
                     "I"
                 } else {
@@ -524,6 +546,15 @@ fn join_tokens(tokens: &[Token], lang: Language) -> String {
                 if s.is_empty() {
                     continue; // never start with stray punctuation
                 }
+                if decimal_glue(tokens, i, *c) {
+                    while s.ends_with(char::is_whitespace) {
+                        s.pop();
+                    }
+                    s.push(*c);
+                    glued = true;
+                    continue; // no trailing space either: `3.14`, not `3. 14`
+                }
+                glued = false;
                 // Glue to the previous token: no space before a mark and
                 // none between back-to-back marks ("12% ," -> "12%,",
                 // "готово. ," -> "готово.,").
@@ -538,12 +569,77 @@ fn join_tokens(tokens: &[Token], lang: Language) -> String {
     s.trim().to_string()
 }
 
-/// Uppercase the first alphabetic character of a string.
-fn capitalize_first(s: &mut String) {
-    if let Some((i, c)) = s.char_indices().find(|(_, c)| c.is_alphabetic()) {
-        let upper: String = c.to_uppercase().collect();
-        s.replace_range(i..i + c.len_utf8(), &upper);
+/// Marks that collapse when stuck together (`.,` -> `.`, `,,` -> `,`).
+const RUN_MARKS: [char; 7] = [',', '.', ';', ':', '!', '?', '…'];
+
+/// Collapse runs of adjacent punctuation marks (`.,` -> `.`, `,,` -> `,`,
+/// `!?` -> `?!`), preserving `...`, `?!` and single marks. Decimal points
+/// and in-number commas survive (digits break the runs).
+pub fn collapse_punctuation(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if !RUN_MARKS.contains(&chars[i]) {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < chars.len() && RUN_MARKS.contains(&chars[j]) {
+            j += 1;
+        }
+        out.push_str(&collapse_run(&chars[i..j]));
+        i = j;
     }
+    out
+}
+
+fn collapse_run(run: &[char]) -> String {
+    if run.iter().filter(|&&c| c == '.').count() >= 3 {
+        return "...".to_string();
+    }
+    if run.contains(&'…') {
+        return "…".to_string();
+    }
+    if run.contains(&'?') && run.contains(&'!') {
+        return "?!".to_string();
+    }
+    if let Some(&c) = run.iter().find(|c| matches!(c, '.' | '?' | '!')) {
+        return c.to_string();
+    }
+    // Weak-only run (`,`, `;`, `:`): keep the first mark.
+    run.first().map(|c| c.to_string()).unwrap_or_default()
+}
+
+/// Uppercase the first letter of every sentence (`все. жду` -> `Все. Жду`).
+/// A dot between digits (`3.14`) is not a boundary.
+fn capitalize_sentences(s: &mut String) {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut after_terminator = true; // start of text is a boundary
+    for (i, &c) in chars.iter().enumerate() {
+        if c.is_whitespace() {
+            out.push(c);
+            continue;
+        }
+        if after_terminator && c.is_alphabetic() {
+            out.extend(c.to_uppercase());
+            after_terminator = false;
+            continue;
+        }
+        out.push(c);
+        if c.is_alphabetic() {
+            after_terminator = false;
+        } else if matches!(c, '?' | '!' | '…') || (c == '.' && !is_decimal_dot(&chars, i)) {
+            after_terminator = true;
+        }
+    }
+    *s = out;
+}
+
+fn is_decimal_dot(chars: &[char], i: usize) -> bool {
+    i > 0 && i + 1 < chars.len() && chars[i - 1].is_ascii_digit() && chars[i + 1].is_ascii_digit()
 }
 
 /// Format a raw dictation string into final, publish-ready text.
@@ -605,13 +701,15 @@ pub fn format(raw: &str, lang: Language) -> String {
     if text.is_empty() {
         return String::new();
     }
-
-    capitalize_first(&mut text);
     if term.is_empty() {
         text.push(kind.punctuation());
     } else {
         text.push_str(term);
     }
+    // The recognizer may glue or double marks ("12% ,", "готово.,");
+    // collapse runs, then case every sentence start.
+    text = collapse_punctuation(&text);
+    capitalize_sentences(&mut text);
     text
 }
 

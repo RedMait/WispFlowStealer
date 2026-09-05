@@ -104,6 +104,12 @@ pub fn ensure_server() -> Result<u16, String> {
     }
 
     let mut cmd = Command::new(&bin);
+    // A console child of a windowless parent would open a terminal window
+    // that stays around (and steals focus); run it headless instead.
+    {
+        use std::os::windows::process::CommandExt as _;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
     cmd.arg("-m")
         .arg(&model)
         .arg("--host")
