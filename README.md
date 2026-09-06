@@ -45,6 +45,19 @@ hold Right Ctrl  ->  speak  ->  release  ->  "эм я тут подумал чт
 
 ## Quickstart
 
+### 0. Ready binary (Windows, no Rust needed)
+
+Download `flowvoice-windows-x64.zip` from the latest
+[GitHub Release](https://github.com/RedMait/WispFlowStealer/releases),
+unpack, then inside the folder:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File get-native.ps1  # models + whisper binaries
+.\flowvoice.exe --gui
+```
+
+Prefer building from source? Continue below.
+
 ### 1. Formatting engine (works on any OS, no mic needed)
 
 ```sh

@@ -105,10 +105,10 @@ fn export_history_jsonl(state: &Arc<AppState>) -> Result<String, String> {
     Ok(path.display().to_string())
 }
 
-/// Human `HH:MM:SS` for a history entry.
+/// Human `DD.MM HH:MM:SS` for a history entry.
 fn fmt_time(when: std::time::SystemTime) -> String {
     chrono::DateTime::<chrono::Local>::from(when)
-        .format("%H:%M:%S")
+        .format("%d.%m %H:%M:%S")
         .to_string()
 }
 

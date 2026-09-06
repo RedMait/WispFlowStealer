@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: MIT
+# Release automation: pushing a tag like `v0.1.0` builds the Windows GUI
+# exe, stamps the icon, and publishes `flowvoice-windows-x64.zip` as a
+# GitHub Release asset. Users download the zip, run `get-native.ps1`
+# once (models + whisper binaries), then `flowvoice.exe --gui`.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build (release, audio + gui)
+        run: cargo build --release -p flowvoice --features audio,gui
+
+      - name: Stamp icon
+        shell: pwsh
+        run: |
+          curl.exe -fSL -o rcedit.exe https://github.com/electron/rcedit/releases/latest/download/rcedit-x64.exe
+          .\rcedit.exe target/release/flowvoice.exe --set-icon assets/flowvoice.ico
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/flowvoice | Out-Null
+          Copy-Item target/release/flowvoice.exe dist/flowvoice/
+          Copy-Item README.md, LICENSE, THIRD-PARTY.md dist/flowvoice/
+          Copy-Item scripts/get-native.ps1 dist/flowvoice/
+          Compress-Archive -Path dist/flowvoice -DestinationPath flowvoice-windows-x64.zip
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: flowvoice-windows-x64.zip
+          generate_release_notes: true

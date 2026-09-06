@@ -10,7 +10,7 @@ use std::os::raw::{c_int, c_void};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
 #[cfg(any(feature = "audio", feature = "gui"))]
-use crate::state::self;
+use crate::state;
 #[cfg(feature = "audio")]
 use crate::state::AppState;
 
@@ -334,7 +334,10 @@ fn finish(text: &str) {
         .unwrap_or(false);
     let text = flowcore::pad_replica_start(text, spaced);
     state::emit(&format!("[final] {text}"));
-    paste(&text);
+    let total = paste(&text);
+    if total > 0.0 {
+        state::emit(&format!("[timing] {total:.1}s keyup->paste"));
+    }
 }
 
 /// Copy the text to the clipboard and simulate Ctrl+V. Pasting is the
@@ -376,14 +379,12 @@ pub(crate) fn paste(text: &str) -> f32 {
         keybd_event(VK_CONTROL as u8, 0, KEYEVENTF_KEYUP, 0);
     }
 
-    // Latency from hotkey release to the finished paste, straight to the log.
-    // The release instant is taken once and shared with the journal below.
+    // Latency from hotkey release to the finished paste. The release
+    // instant is taken once and shared with the journal below; the
+    // breakdown line itself is emitted by `finish()`.
     let keyup = KEYUP_AT.lock().ok().and_then(|mut slot| slot.take());
     let keydown = KEYDOWN_AT.lock().ok().and_then(|mut slot| slot.take());
     let secs = keyup.map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0);
-    if keyup.is_some() {
-        state::emit(&format!("[timing] {secs:.1}s keyup->paste"));
-    }
 
     // Restore what the user had (L-01); empty stays empty (L-04).
     // Best-effort: a busy clipboard only costs the restore, never the paste.
