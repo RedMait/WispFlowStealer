@@ -164,12 +164,48 @@ struct GuiApp {
     status_line: String,
     history_search: String,
     history_app_filter: String,
+    tab: Tab,
     tray: Option<TrayIcon>,
     show_item: MenuItem,
     pause_item: MenuItem,
     quit_item: MenuItem,
     quit_requested: bool,
     icon_recording: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Status,
+    History,
+    Stats,
+    Settings,
+}
+
+impl Tab {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Status => "Статус",
+            Self::History => "История",
+            Self::Stats => "Статистика",
+            Self::Settings => "Настройки",
+        }
+    }
+}
+
+/// Product theme: dark indigo-accent UI, rounded cards.
+fn apply_theme(ctx: &egui::Context) {
+    let mut visuals = egui::Visuals::dark();
+    let accent = egui::Color32::from_rgb(129, 140, 248);
+    visuals.window_corner_radius = egui::CornerRadius::same(12);
+    visuals.menu_corner_radius = egui::CornerRadius::same(8);
+    visuals.selection.bg_fill = accent;
+    visuals.hyperlink_color = accent;
+    visuals.panel_fill = egui::Color32::from_rgb(20, 22, 30);
+    visuals.window_fill = egui::Color32::from_rgb(24, 26, 36);
+    visuals.faint_bg_color = egui::Color32::from_rgb(30, 33, 45);
+    // Visible input fields on the dark background (like buttons, not pits).
+    visuals.extreme_bg_color = egui::Color32::from_rgb(42, 46, 61);
+    ctx.set_visuals(visuals);
 }
 
 impl GuiApp {
@@ -207,8 +243,11 @@ impl GuiApp {
                     "[gui] dictation resumed (tray)".to_string()
                 });
             } else if event.id == self.quit_item.id() {
+                // Graceful viewport Close is unreliable (the loop may
+                // survive it): flush state and terminate deterministically.
                 self.quit_requested = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                self.save_history();
+                std::process::exit(0);
             }
         }
         for event in TrayIconEvent::receiver().try_iter() {
@@ -260,56 +299,68 @@ impl GuiApp {
             .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
+    fn show_header(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::top("header").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("flowvoice").size(20.0).strong());
+                let recording = self
+                    .state
+                    .recording
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                if !win::is_enabled() {
+                    ui.label(
+                        egui::RichText::new("[пауза]")
+                            .color(egui::Color32::from_rgb(150, 150, 150))
+                            .strong(),
+                    );
+                } else if recording {
+                    ui.label(
+                        egui::RichText::new("[запись]")
+                            .color(egui::Color32::from_rgb(230, 60, 60))
+                            .strong(),
+                    );
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let paused = !win::is_enabled();
+                    if ui
+                        .button(if paused {
+                            "Слушать"
+                        } else {
+                            "Пауза"
+                        })
+                        .clicked()
+                    {
+                        win::set_enabled(paused);
+                        self.pause_item.set_text(if paused {
+                            "Слушать"
+                        } else {
+                            "Пауза"
+                        });
+                        self.state.push_log(if paused {
+                            "[gui] dictation resumed".to_string()
+                        } else {
+                            "[gui] dictation paused".to_string()
+                        });
+                    }
+                });
+            });
+            ui.horizontal(|ui| {
+                for tab in [Tab::Status, Tab::History, Tab::Stats, Tab::Settings] {
+                    ui.selectable_value(&mut self.tab, tab, tab.label());
+                }
+            });
+        });
+    }
+
     fn show_status(&self, ui: &mut egui::Ui) {
         ui.heading("Статус");
-        let recording = self
+        let backend = self
             .state
-            .recording
-            .load(std::sync::atomic::Ordering::SeqCst);
-        ui.horizontal(|ui| {
-            if !win::is_enabled() {
-                ui.label(
-                    egui::RichText::new("[пауза]")
-                        .color(egui::Color32::from_rgb(150, 150, 150))
-                        .strong(),
-                );
-            } else if recording {
-                let secs = self.state.recording_secs();
-                ui.label(
-                    egui::RichText::new(format!("[ЗАПИСЬ {secs} c]"))
-                        .color(egui::Color32::from_rgb(230, 60, 60))
-                        .strong(),
-                );
-            } else {
-                ui.label(
-                    egui::RichText::new("[готов]")
-                        .color(egui::Color32::from_rgb(80, 200, 120))
-                        .strong(),
-                );
-            }
-            let backend = self
-                .state
-                .backend_label
-                .lock()
-                .map(|b| b.clone())
-                .unwrap_or_default();
-            ui.label(format!("бэкенд: {backend}"));
-            // Master switch: pause/resume dictation, window stays open.
-            let paused = !win::is_enabled();
-            let label = if paused {
-                "Слушать (вкл)"
-            } else {
-                "Пауза (выкл)"
-            };
-            if ui.button(label).clicked() {
-                win::set_enabled(paused);
-                self.state.push_log(if paused {
-                    "[gui] dictation resumed".to_string()
-                } else {
-                    "[gui] dictation paused".to_string()
-                });
-            }
-        });
+            .backend_label
+            .lock()
+            .map(|b| b.clone())
+            .unwrap_or_default();
+        ui.label(format!("бэкенд: {backend}"));
         let last = self
             .state
             .last_text
@@ -461,29 +512,36 @@ impl GuiApp {
         let mut delete_idx: Option<usize> = None;
         egui::ScrollArea::vertical()
             .id_salt("history")
-            .max_height(220.0)
+            .auto_shrink([false, false])
             .show(ui, |ui| {
                 if entries.is_empty() {
                     ui.label("пока пусто — зажмите хоткей и надиктуйте");
                 }
                 for (idx, when, app, text) in entries {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(when).weak().small());
-                        if !app.is_empty() {
-                            ui.label(egui::RichText::new(app).weak().small());
-                        }
-                        if ui.small_button("Копия").clicked() {
-                            if let Ok(mut cb) = arboard::Clipboard::new() {
-                                let _ = cb.set_text(text.clone());
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(when).weak().small());
+                            if !app.is_empty() {
+                                ui.label(egui::RichText::new(app).weak().small());
                             }
-                        }
-                        if ui.small_button("Вставить").clicked() {
-                            crate::win::paste(&text);
-                        }
-                        if ui.small_button("Удал.").clicked() {
-                            delete_idx = Some(idx);
-                        }
-                        ui.label(text);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("Удал.").clicked() {
+                                        delete_idx = Some(idx);
+                                    }
+                                    if ui.small_button("Вставить").clicked() {
+                                        crate::win::paste(&text);
+                                    }
+                                    if ui.small_button("Копия").clicked() {
+                                        if let Ok(mut cb) = arboard::Clipboard::new() {
+                                            let _ = cb.set_text(text.clone());
+                                        }
+                                    }
+                                },
+                            );
+                        });
+                        ui.label(egui::RichText::new(text).size(14.0));
                     });
                     ui.separator();
                 }
@@ -564,17 +622,18 @@ impl GuiApp {
                 .with_transparent(true)
                 .with_resizable(false)
                 .with_always_on_top()
-                .with_inner_size([280.0, 72.0]),
+                .with_inner_size([180.0, 52.0])
+                .with_position([12.0, 12.0]),
             |ui, _| {
                 ui.vertical_centered(|ui| {
                     let secs = self.state.recording_secs();
                     ui.label(
-                        egui::RichText::new(format!("[{secs} c] говорите…"))
+                        egui::RichText::new(format!("[{secs} c]"))
                             .color(egui::Color32::from_rgb(230, 70, 70))
-                            .size(22.0)
+                            .size(15.0)
                             .strong(),
                     );
-                    ui.label(egui::RichText::new("отпустите хоткей для вставки").weak());
+                    ui.label(egui::RichText::new("отпустите хоткей").size(11.0).weak());
                 });
                 ui.ctx().request_repaint_after(Duration::from_millis(250));
             },
@@ -591,6 +650,8 @@ impl eframe::App for GuiApp {
             self.state.push_log("[gui] hidden to tray".to_string());
         }
 
+        apply_theme(&ctx);
+
         self.poll_tray(&ctx);
         self.refresh_tray_icon();
         if self
@@ -601,17 +662,27 @@ impl eframe::App for GuiApp {
             self.save_history();
         }
 
-        egui::ScrollArea::vertical().id_salt("main").show(ui, |ui| {
-            self.show_status(ui);
-            ui.add_space(8.0);
-            self.show_settings(ui);
-            ui.add_space(8.0);
-            self.show_history(ui);
-            ui.add_space(8.0);
-            self.show_stats(ui);
-            ui.add_space(8.0);
-            self.show_log(ui);
-        });
+        self.show_header(ui);
+        match self.tab {
+            Tab::Status => {
+                egui::ScrollArea::vertical().id_salt("tab").show(ui, |ui| {
+                    self.show_status(ui);
+                    ui.add_space(8.0);
+                    self.show_log(ui);
+                });
+            }
+            Tab::History => self.show_history(ui),
+            Tab::Stats => {
+                egui::ScrollArea::vertical().id_salt("tab").show(ui, |ui| {
+                    self.show_stats(ui);
+                });
+            }
+            Tab::Settings => {
+                egui::ScrollArea::vertical().id_salt("tab").show(ui, |ui| {
+                    self.show_settings(ui);
+                });
+            }
+        }
 
         let ctx = ui.ctx().clone();
         self.show_overlay(&ctx);
@@ -750,6 +821,7 @@ pub fn run() {
                 status_line: String::new(),
                 history_search: String::new(),
                 history_app_filter: String::new(),
+                tab: Tab::Status,
                 tray,
                 show_item,
                 pause_item,
