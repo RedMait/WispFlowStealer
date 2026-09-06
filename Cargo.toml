@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/flowcore", "crates/app", "crates/punct"]
+exclude = ["native/vosk-sys"]
 
 [workspace.package]
 version = "0.1.0"

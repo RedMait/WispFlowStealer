@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Desktop GUI (eframe + system tray), launched with `--gui`.
 //!
 //! Windows-only v1: a status/settings/history window, a recording pill
@@ -14,16 +15,9 @@ use tray_icon::{
     TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
 
+use crate::state::app_dir;
 use crate::state::{self, AppState, BackendPref, Settings};
 use crate::win::{self, Hotkey};
-
-/// `%APPDATA%/WispFlowStealer` (settings + history live here).
-fn app_dir() -> std::path::PathBuf {
-    std::env::var_os("APPDATA")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("WispFlowStealer")
-}
 
 fn read_json(name: &str) -> Option<serde_json::Value> {
     std::fs::read(app_dir().join(name))
@@ -62,6 +56,14 @@ fn load_settings() -> Settings {
         if let Some(b) = v.get("backend").and_then(|x| x.as_str()) {
             s.backend = BackendPref::parse(b);
         }
+        if let Some(p) = v.get("profile").and_then(|x| x.as_str()) {
+            if matches!(p, "auto" | "chat" | "mail" | "code") {
+                s.profile = p.to_string();
+            }
+        }
+        if let Some(sound) = v.get("sound").and_then(|x| x.as_bool()) {
+            s.sound = sound;
+        }
     }
     // Env wins over the file for the backend choice.
     if let Some(env_pref) = BackendPref::from_env() {
@@ -78,8 +80,29 @@ fn save_settings(s: &Settings) -> Result<(), String> {
             "lang": s.lang,
             "groq_model": s.groq_model,
             "backend": s.backend.label(),
+            "profile": s.profile,
+            "sound": s.sound,
         }),
     )
+}
+
+/// History export (M-11): JSONL with UTC timestamps + app, next to settings.
+fn export_history_jsonl(state: &Arc<AppState>) -> Result<String, String> {
+    let lines: Vec<String> = state
+        .history
+        .lock()
+        .map(|h| {
+            h.iter()
+                .map(|e| {
+                    let ts = chrono::DateTime::<chrono::Utc>::from(e.when).to_rfc3339();
+                    serde_json::json!({"ts": ts, "app": e.app, "text": e.text}).to_string()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let path = app_dir().join("history-export.jsonl");
+    std::fs::write(&path, lines.join("\n")).map_err(|e| format!("экспорт: {e}"))?;
+    Ok(path.display().to_string())
 }
 
 /// Human `HH:MM:SS` for a history entry.
@@ -139,6 +162,8 @@ struct GuiApp {
     state: Arc<AppState>,
     settings: Settings,
     status_line: String,
+    history_search: String,
+    history_app_filter: String,
     tray: Option<TrayIcon>,
     show_item: MenuItem,
     pause_item: MenuItem,
@@ -157,6 +182,11 @@ impl GuiApp {
         }
         std::env::set_var("FLOWVOICE_LANG", &self.settings.lang);
         std::env::set_var("FLOWVOICE_GROQ_MODEL", &self.settings.groq_model);
+        std::env::set_var("FLOWVOICE_PROFILE", &self.settings.profile);
+        std::env::set_var(
+            "FLOWVOICE_SOUND",
+            if self.settings.sound { "1" } else { "0" },
+        );
     }
 
     fn poll_tray(&mut self, ctx: &egui::Context) {
@@ -218,6 +248,7 @@ impl GuiApp {
                         serde_json::json!({
                             "when": e.when.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
                             "text": e.text,
+                            "app": e.app,
                         })
                     })
                     .collect()
@@ -352,6 +383,17 @@ impl GuiApp {
                     }
                 });
         });
+        ui.horizontal(|ui| {
+            ui.label("Профиль:");
+            egui::ComboBox::from_id_salt("profile")
+                .selected_text(self.settings.profile.clone())
+                .show_ui(ui, |ui| {
+                    for name in ["auto", "chat", "mail", "code"] {
+                        ui.selectable_value(&mut self.settings.profile, name.to_string(), name);
+                    }
+                });
+            ui.checkbox(&mut self.settings.sound, "Звуки");
+        });
         if ui.button("Сохранить и применить").clicked() {
             match save_settings(&self.settings) {
                 Ok(()) => {
@@ -367,7 +409,7 @@ impl GuiApp {
         }
     }
 
-    fn show_history(&self, ui: &mut egui::Ui) {
+    fn show_history(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("История");
             if ui.button("Очистить").clicked() {
@@ -378,18 +420,45 @@ impl GuiApp {
                     .history_dirty
                     .store(true, std::sync::atomic::Ordering::SeqCst);
             }
+            if ui.button("Экспорт JSONL").clicked() {
+                match export_history_jsonl(&self.state) {
+                    Ok(path) => self.status_line = format!("история: {path}"),
+                    Err(e) => self.status_line = e,
+                }
+            }
         });
-        let entries: Vec<(String, String)> = self
+        ui.horizontal(|ui| {
+            ui.label("Поиск:");
+            ui.add_sized(
+                [180.0, 22.0],
+                egui::TextEdit::singleline(&mut self.history_search),
+            );
+            ui.label("Приложение:");
+            ui.add_sized(
+                [140.0, 22.0],
+                egui::TextEdit::singleline(&mut self.history_app_filter),
+            );
+        });
+        let query = self.history_search.to_lowercase();
+        let app_q = self.history_app_filter.to_lowercase();
+        // Newest first, with source indices for deletion.
+        let entries: Vec<(usize, String, String, String)> = self
             .state
             .history
             .lock()
             .map(|h| {
                 h.iter()
+                    .enumerate()
                     .rev()
-                    .map(|e| (fmt_time(e.when), e.text.clone()))
+                    .filter(|(_, e)| {
+                        (query.is_empty() || e.text.to_lowercase().contains(&query))
+                            && (app_q.is_empty() || e.app.to_lowercase().contains(&app_q))
+                    })
+                    .map(|(i, e)| (i, fmt_time(e.when), e.app.clone(), e.text.clone()))
                     .collect()
             })
             .unwrap_or_default();
+        let mut delete_idx: Option<usize> = None;
         egui::ScrollArea::vertical()
             .id_salt("history")
             .max_height(220.0)
@@ -397,19 +466,73 @@ impl GuiApp {
                 if entries.is_empty() {
                     ui.label("пока пусто — зажмите хоткей и надиктуйте");
                 }
-                for (when, text) in entries {
+                for (idx, when, app, text) in entries {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(when).weak().small());
+                        if !app.is_empty() {
+                            ui.label(egui::RichText::new(app).weak().small());
+                        }
                         if ui.small_button("Копия").clicked() {
                             if let Ok(mut cb) = arboard::Clipboard::new() {
                                 let _ = cb.set_text(text.clone());
                             }
+                        }
+                        if ui.small_button("Вставить").clicked() {
+                            crate::win::paste(&text);
+                        }
+                        if ui.small_button("Удал.").clicked() {
+                            delete_idx = Some(idx);
                         }
                         ui.label(text);
                     });
                     ui.separator();
                 }
             });
+        if let Some(idx) = delete_idx {
+            if let Ok(mut h) = self.state.history.lock() {
+                if idx < h.len() {
+                    h.remove(idx);
+                    self.state
+                        .history_dirty
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }
+    }
+
+    fn show_stats(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Статистика");
+        let entries = crate::journal::read_all(&crate::state::journal_path());
+        let day_start = chrono::Local::now()
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .and_then(|d| d.and_local_timezone(chrono::Local).single())
+            .map(|d| d.timestamp() as u64)
+            .unwrap_or(0);
+        let today = crate::journal::stats_since(&entries, day_start);
+        let total = crate::journal::stats_since(&entries, 0);
+        ui.label(format!(
+            "Сегодня: реплик {}, слов {}, средняя задержка {:.1} c, средний темп {:.0} сл/мин, рекорд {:.0}",
+            today.replicas, today.words, today.avg_secs, today.avg_wpm, today.best_wpm
+        ));
+        ui.label(format!(
+            "Всего: реплик {}, слов {}, средняя задержка {:.1} c",
+            total.replicas, total.words, total.avg_secs
+        ));
+        ui.horizontal(|ui| {
+            if ui.button("Экспорт CSV").clicked() {
+                let path = crate::state::app_dir().join("stats.csv");
+                match std::fs::write(&path, crate::journal::to_csv(&entries)) {
+                    Ok(()) => self.status_line = format!("статистика: {}", path.display()),
+                    Err(e) => self.status_line = format!("CSV: {e}"),
+                }
+            }
+            if ui.button("Сбросить статистику").clicked() {
+                // Journal only: visible history stays (AL-13).
+                let _ = std::fs::remove_file(crate::state::journal_path());
+                self.status_line = "статистика сброшена, история цела".to_string();
+            }
+        });
     }
 
     fn show_log(&self, ui: &mut egui::Ui) {
@@ -485,6 +608,8 @@ impl eframe::App for GuiApp {
             ui.add_space(8.0);
             self.show_history(ui);
             ui.add_space(8.0);
+            self.show_stats(ui);
+            ui.add_space(8.0);
             self.show_log(ui);
         });
 
@@ -534,8 +659,15 @@ fn build_tray() -> (Option<TrayIcon>, MenuItem, MenuItem, MenuItem) {
 
 /// Entry point for `--gui`: hook thread + preload + tray + event loop.
 pub fn run() {
+    if !win::ensure_single_instance() {
+        win::fatal_popup("flowvoice is already running (single instance)");
+        std::process::exit(1);
+    }
     let state = AppState::new();
     state::attach(state.clone());
+    if let Some(msg) = state::take_pending_notice() {
+        state::emit(&msg);
+    }
 
     // Restore persisted history.
     if let Some(v) = read_json("history.json") {
@@ -553,6 +685,11 @@ pub fn run() {
                     history.push(crate::state::HistoryEntry {
                         when: std::time::UNIX_EPOCH + Duration::from_secs(secs),
                         text: text.to_string(),
+                        app: item
+                            .get("app")
+                            .and_then(|a| a.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
                     });
                 }
             }
@@ -583,6 +720,8 @@ pub fn run() {
     // Apply (hotkey already set via spawn_pump; env for STT modules).
     std::env::set_var("FLOWVOICE_LANG", &settings.lang);
     std::env::set_var("FLOWVOICE_GROQ_MODEL", &settings.groq_model);
+    std::env::set_var("FLOWVOICE_PROFILE", &settings.profile);
+    std::env::set_var("FLOWVOICE_SOUND", if settings.sound { "1" } else { "0" });
     if let Ok(mut pref) = state.backend_pref.lock() {
         *pref = settings.backend;
     }
@@ -609,6 +748,8 @@ pub fn run() {
                 state: app_state.clone(),
                 settings,
                 status_line: String::new(),
+                history_search: String::new(),
+                history_app_filter: String::new(),
                 tray,
                 show_item,
                 pause_item,

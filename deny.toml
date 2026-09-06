@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: MIT
+# cargo-deny configuration (Z-10 license compatibility gate).
+# Dual-licensed crates are used under their permissive option; option-ext
+# (pure MPL-2.0, unmodified, only built for non-Windows targets) is covered
+# by the THIRD-PARTY.md notice.
+
+[graph]
+targets = ["x86_64-pc-windows-msvc"]
+all-features = true
+
+[licenses]
+# Anything not allowed below (incl. strong copyleft) fails the check.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "BlueOak-1.0.0",
+    "ISC",
+    "Unlicense",
+    "Zlib",
+    "0BSD",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+    "Unicode-3.0",
+]
+
+[[licenses.exceptions]]
+name = "option-ext"
+version = "0.2.0"
+allow = ["MPL-2.0"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

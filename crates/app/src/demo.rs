@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use flowcore::{classify, format, Language};
 
 /// Run the full dictation pipeline on static text and print every stage.

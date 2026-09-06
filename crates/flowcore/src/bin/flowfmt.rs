@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use std::io::{self, Read};
 
 use flowcore::{format, Language};

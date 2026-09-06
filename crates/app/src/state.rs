@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Shared runtime state between the hotkey hook thread and the GUI.
 //!
 //! Windows-only. Dependency-free (`std` only): timestamps are stored as
@@ -9,71 +10,9 @@ use std::sync::{
     Arc, Mutex, OnceLock,
 };
 
-/// Speech backend preference (GUI setting + `FLOWVOICE_BACKEND` env).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackendPref {
-    Auto,
-    Groq,
-    Local,
-    Vosk,
-}
-
-impl BackendPref {
-    #[cfg(feature = "gui")]
-    pub fn all() -> &'static [BackendPref] {
-        &[Self::Auto, Self::Groq, Self::Local, Self::Vosk]
-    }
-
-    #[cfg(feature = "gui")]
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Groq => "groq cloud",
-            Self::Local => "whisper local",
-            Self::Vosk => "vosk",
-        }
-    }
-
-    #[cfg(any(feature = "audio", feature = "gui"))]
-    pub fn parse(s: &str) -> Self {
-        match s.to_ascii_lowercase().as_str() {
-            "groq" | "groq cloud" => Self::Groq,
-            "local" | "whisper" | "whisper local" => Self::Local,
-            "vosk" => Self::Vosk,
-            _ => Self::Auto,
-        }
-    }
-
-    /// Env override (`FLOWVOICE_BACKEND`), `None` when unset/invalid.
-    #[cfg(any(feature = "audio", feature = "gui"))]
-    pub fn from_env() -> Option<Self> {
-        std::env::var("FLOWVOICE_BACKEND")
-            .ok()
-            .map(|s| Self::parse(&s))
-            .filter(|p| *p != Self::Auto)
-            .or_else(|| {
-                std::env::var("FLOWVOICE_BACKEND")
-                    .ok()
-                    .filter(|s| s.eq_ignore_ascii_case("auto"))
-                    .map(|_| Self::Auto)
-            })
-    }
-
-    #[cfg(feature = "audio")]
-    pub fn allows_groq(self) -> bool {
-        matches!(self, Self::Auto | Self::Groq)
-    }
-
-    #[cfg(feature = "audio")]
-    pub fn allows_local(self) -> bool {
-        matches!(self, Self::Auto | Self::Local)
-    }
-
-    #[cfg(feature = "audio")]
-    pub fn allows_vosk(self) -> bool {
-        matches!(self, Self::Auto | Self::Vosk)
-    }
-}
+/// Backend preference lives in [`crate::backend`]; re-exported so existing
+/// `state::BackendPref` paths keep working.
+pub use crate::backend::BackendPref;
 
 /// GUI-editable settings (persisted as JSON by the GUI; env wins at runtime).
 #[cfg(feature = "gui")]
@@ -83,6 +22,8 @@ pub struct Settings {
     pub lang: String,
     pub groq_model: String,
     pub backend: BackendPref,
+    pub profile: String,
+    pub sound: bool,
 }
 
 #[cfg(feature = "gui")]
@@ -93,6 +34,8 @@ impl Default for Settings {
             lang: "ru".to_string(),
             groq_model: "whisper-large-v3-turbo".to_string(),
             backend: BackendPref::Auto,
+            profile: "auto".to_string(),
+            sound: true,
         }
     }
 }
@@ -104,6 +47,8 @@ impl Default for Settings {
 pub struct HistoryEntry {
     pub when: std::time::SystemTime,
     pub text: String,
+    /// Foreground window title at capture time (M-02, may be empty).
+    pub app: String,
 }
 
 /// Live state shared by the hook thread (producer) and the GUI (consumer).
@@ -121,6 +66,9 @@ pub struct AppState {
     pub history: Mutex<Vec<HistoryEntry>>,
     /// Set when the history changed and needs a disk save.
     pub history_dirty: AtomicBool,
+    /// Pre-edit text for the `отмени` voice command (J-15).
+    #[cfg(feature = "audio")]
+    pub undo_slot: Mutex<Option<String>>,
     /// Active backend preference (GUI setting or `FLOWVOICE_BACKEND`).
     pub backend_pref: Mutex<BackendPref>,
     /// egui handle for cross-thread repaint kicks (GUI mode only).
@@ -139,6 +87,8 @@ impl AppState {
             log: Mutex::new(VecDeque::with_capacity(200)),
             history: Mutex::new(Vec::new()),
             history_dirty: AtomicBool::new(false),
+            #[cfg(feature = "audio")]
+            undo_slot: Mutex::new(None),
             backend_pref: Mutex::new(BackendPref::from_env().unwrap_or(BackendPref::Auto)),
             #[cfg(feature = "gui")]
             egui_ctx: OnceLock::new(),
@@ -181,7 +131,8 @@ impl AppState {
             .unwrap_or_default()
     }
 
-    pub fn push_history(&self, text: String) {
+    #[cfg(feature = "audio")]
+    pub fn push_history(&self, text: String, app: String) {
         if let Ok(mut history) = self.history.lock() {
             if history.len() >= 100 {
                 history.remove(0);
@@ -189,12 +140,14 @@ impl AppState {
             history.push(HistoryEntry {
                 when: std::time::SystemTime::now(),
                 text,
+                app,
             });
         }
         self.history_dirty.store(true, Ordering::SeqCst);
         self.kick_ui();
     }
 
+    #[cfg(feature = "audio")]
     pub fn set_backend_label(&self, label: &str) {
         if let Ok(mut current) = self.backend_label.lock() {
             *current = label.to_string();
@@ -230,10 +183,109 @@ pub fn get() -> Option<Arc<AppState>> {
 /// Windowed GUI builds may have no valid stdout at all (double-clicked
 /// exe), where `println!` would panic — so GUI-attached code must use
 /// this instead of printing directly.
+///
+/// `[error]` lines are additionally appended to a local error log (O-17).
 pub fn emit(line: &str) {
     if let Some(s) = get() {
         s.push_log(line.to_string());
     } else {
         println!("{line}");
     }
+    if line.starts_with("[error]") {
+        append_error_log(line);
+    }
+}
+
+/// Local error log with size rotation (O-17/O-19): `errors.log`, older
+/// content moves to `errors.old.log` past 1 MiB.
+#[cfg(any(feature = "audio", feature = "gui"))]
+fn append_error_log(line: &str) {
+    use std::io::Write as _;
+    let path = app_dir().join("errors.log");
+    if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > 1024 * 1024 {
+        let old = app_dir().join("errors.old.log");
+        let _ = std::fs::remove_file(&old);
+        let _ = std::fs::rename(&path, &old);
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(f, "[{ts}] {line}");
+        ensure_private(&path);
+    }
+}
+
+/// Owner-only file permissions, best-effort (P-11): strip inheritance,
+/// grant the current user read/write. Failures are ignored (portable
+/// installs, unusual ACLs) — the files simply keep inherited rights.
+#[cfg(any(feature = "audio", feature = "gui"))]
+fn ensure_private(path: &std::path::Path) {
+    use std::sync::Once;
+    static DONE: Once = Once::new();
+    DONE.call_once(|| {
+        let _ = std::process::Command::new("icacls")
+            .arg(path)
+            .arg("/inheritance:r")
+            .arg("/grant:r")
+            .arg(format!(
+                "{}:(R,W)",
+                std::env::var("USERNAME").unwrap_or_else(|_| "OWNER RIGHTS".to_string())
+            ))
+            .output();
+    });
+}
+
+/// Crash-recovery marker (O-09): written at capture start, removed after
+/// paste. A leftover at startup means the previous run died mid-replica.
+#[cfg(any(feature = "audio", feature = "gui"))]
+pub(crate) fn write_pending() {
+    let path = app_dir().join("pending.json");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let _ = std::fs::write(&path, format!("{{\"started\":{ts}}}"));
+}
+
+/// Returns the leftover marker message, if any, and clears it (O-10).
+#[cfg(any(feature = "audio", feature = "gui"))]
+pub(crate) fn take_pending_notice() -> Option<String> {
+    let path = app_dir().join("pending.json");
+    let body = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    Some(format!(
+        "[recover] previous run stopped mid-replica ({body}); dictate it again"
+    ))
+}
+
+#[cfg(any(feature = "audio", feature = "gui"))]
+pub(crate) fn clear_pending() {
+    let _ = std::fs::remove_file(app_dir().join("pending.json"));
+}
+
+/// `%APPDATA%/WispFlowStealer` (settings, history, journal live here).
+#[cfg(any(feature = "audio", feature = "gui"))]
+pub(crate) fn app_dir() -> std::path::PathBuf {
+    std::env::var_os("APPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("WispFlowStealer")
+}
+
+/// `journal.jsonl` path (per-replica JSON lines, T-01).
+#[cfg(any(feature = "audio", feature = "gui"))]
+pub(crate) fn journal_path() -> std::path::PathBuf {
+    app_dir().join("journal.jsonl")
 }

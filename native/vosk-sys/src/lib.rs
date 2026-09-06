@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /* Vendored fork of the `vosk-sys` crate (MIT, https://github.com/Bear-03/vosk-rs).
  *
  * The original exposes vosk functions as ordinary link-time imports, which forces

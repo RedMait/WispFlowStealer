@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Microphone capture plus fully local, offline speech-to-text.
 //!
 //! Only compiled for Windows with the `audio` feature enabled.
@@ -117,17 +118,41 @@ fn punct_instance() -> Option<&'static Punctuator> {
 
 /// Post-process the raw transcript: neural punctuation for Russian when the
 /// model is installed, otherwise the deterministic heuristic pipeline.
+/// A fixed language setting (`FLOWVOICE_LANG=ru|en`) disables auto-detect.
+/// Profile (`FLOWVOICE_PROFILE`) selects Chat/Mail/Code shaping.
 fn finalize(text: String) -> String {
-    let lang = Language::detect(&text);
+    let explicit = std::env::var("FLOWVOICE_LANG").ok();
+    let lang = Language::resolve(explicit.as_deref(), &text);
+    let profile = resolve_profile();
+    // Chat replicas stay short and heuristic; Code keeps identifiers.
+    if profile == flowcore::Profile::Chat {
+        return flowcore::format(&text, lang);
+    }
+    if profile == flowcore::Profile::Code {
+        return flowcore::format_code(&text);
+    }
     if lang == Language::Ru {
         if let Some(punct) = punct_instance() {
             let cleaned = flowcore::clean(&text, lang);
+            // Short texts go through deterministic rules instead of the
+            // neural model (J-09): less latency, fewer surprises.
+            if flowcore::word_count(&cleaned) <= 10 {
+                return flowcore::format(&text, lang);
+            }
             return punct
                 .punct(&cleaned)
                 .unwrap_or_else(|_| flowcore::format(&text, lang));
         }
     }
     flowcore::format(&text, lang)
+}
+
+/// Raw mode (`FLOWVOICE_RAW=1`): skip all post-processing, return the bare
+/// transcript. Also the off switch for post-processing (J-06).
+fn is_raw() -> bool {
+    std::env::var("FLOWVOICE_RAW")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 /// Capture until the hotkey is released, recognize, return final text.
@@ -146,37 +171,182 @@ pub fn transcribe() -> Result<String, String> {
     let pcm16k = resample_to_16k(&pcm, rate);
     let pref = pref();
 
-    if pref.allows_groq() && crate::groq::available() {
-        let raw = crate::groq::transcribe_pcm(&pcm16k)?;
-        set_label("groq cloud");
-        return Ok(format_segments(raw));
-    }
+    // Pure priority table (unit-tested in `backend::select`).
+    let engine = crate::backend::select(
+        pref,
+        crate::groq::available(),
+        crate::whisper::available(),
+        // Probing the multi-GB Vosk model per press would defeat caching;
+        // assume present here and let `model_instance` fail loudly instead.
+        true,
+    )
+    .map_err(|e| e.to_string())?;
+    set_label(engine.label());
 
-    if pref.allows_local() && crate::whisper::available() {
-        let raw = crate::whisper::transcribe_pcm(&pcm16k)?;
-        set_label("whisper local");
-        return Ok(format_segments(raw));
+    match engine {
+        crate::backend::Backend::Groq => {
+            let raw = crate::groq::transcribe_pcm(&pcm16k)?;
+            Ok(apply_commands(format_segments(strip_stage_directions(raw))))
+        }
+        crate::backend::Backend::Local => {
+            let raw = crate::whisper::transcribe_pcm(&pcm16k)?;
+            Ok(apply_commands(format_segments(strip_stage_directions(raw))))
+        }
+        crate::backend::Backend::Vosk => {
+            let model = model_instance()?;
+            let raw = recognize_with(model, &pcm16k)?;
+            if is_raw() {
+                return Ok(raw);
+            }
+            // The neural punctuator may glue marks across words; collapse runs.
+            Ok(apply_commands(flowcore::collapse_punctuation(&finalize(
+                raw,
+            ))))
+        }
     }
+}
 
-    if pref.allows_vosk() {
-        let model = model_instance()?;
-        set_label("vosk");
-        // The neural punctuator may glue marks across words; collapse runs.
-        return Ok(flowcore::collapse_punctuation(&finalize(recognize_with(
-            model, &pcm16k,
-        )?)));
+/// Drop bracketed stage directions without digits (`[музыка]`, `(смеётся)`)
+/// that recognizers sprinkle into transcripts (AM-19). Spans with digits
+/// (`(712) 555-01-01`) are kept: they may be phone numbers.
+fn strip_stage_directions(raw: Vec<String>) -> Vec<String> {
+    raw.into_iter().map(|seg| strip_brackets(&seg)).collect()
+}
+
+fn strip_brackets(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let open = chars[i];
+        let close = match open {
+            '[' => ']',
+            '(' => ')',
+            _ => {
+                out.push(open);
+                i += 1;
+                continue;
+            }
+        };
+        if let Some(rel) = chars[i..].iter().position(|&c| c == close) {
+            let span: String = chars[i + 1..i + rel].iter().collect();
+            if span.chars().any(|c| c.is_ascii_digit()) {
+                out.push_str(&span_surround(open, &span, close));
+            } else if span.trim().is_empty() {
+                out.push(open);
+                out.push(close);
+            }
+            // Digit-free spans vanish (the direction itself is dropped).
+            i += rel + 1;
+        } else {
+            out.push(open);
+            i += 1;
+        }
     }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
 
-    Err("no speech backend enabled: set GROQ_API_KEY or run scripts/get-native.ps1".to_string())
+fn span_surround(open: char, span: &str, close: char) -> String {
+    format!("{open}{span}{close}")
+}
+
+/// Voice commands (`переведи:`, `сократи:`, `замени`, `перепиши`, `отмени`,
+/// `транслит:`): transform instead of dictating. Raw mode skips them along
+/// with all other post-processing.
+fn apply_commands(text: String) -> String {
+    if is_raw() || text.is_empty() {
+        return text;
+    }
+    let Some(cmd) = crate::command::parse(&text) else {
+        return text;
+    };
+    match cmd {
+        crate::command::Command::Transliterate { text } => flowcore::transliterate_ru(&text),
+        crate::command::Command::Replace { from, to } => {
+            let prev = last_replica_text();
+            let next = prev.replacen(&from, &to, 1);
+            if next == prev {
+                return text;
+            }
+            set_undo_slot(prev);
+            next
+        }
+        crate::command::Command::Undo => match take_undo_slot() {
+            Some(prev) => prev,
+            None => text,
+        },
+        crate::command::Command::Translate { target, text } => {
+            match crate::groq::chat(
+                &format!(
+                    "Translate the following text to language code '{target}'. Return only the translation, no quotes, no commentary."
+                ),
+                &text,
+            ) {
+                Ok(t) => {
+                    set_undo_slot(last_replica_text());
+                    t
+                }
+                Err(e) => format!("{text} [команда не выполнена: {e}]"),
+            }
+        }
+        crate::command::Command::Summarize { text } => {
+            match crate::groq::chat(
+                "Сократи следующий текст, сохранив смысл. Верни только сокращённый текст, без кавычек и комментариев.",
+                &text,
+            ) {
+                Ok(t) => {
+                    set_undo_slot(last_replica_text());
+                    t
+                }
+                Err(e) => format!("{text} [{e}]"),
+            }
+        }
+        crate::command::Command::Rewrite => {
+            let prev = last_replica_text();
+            if prev.is_empty() {
+                return text;
+            }
+            match crate::groq::chat(
+                "Перепиши следующий текст другими словами, сохранив смысл. Верни только переписанный текст.",
+                &prev,
+            ) {
+                Ok(t) => {
+                    set_undo_slot(prev);
+                    t
+                }
+                Err(e) => format!("{text} [{e}]"),
+            }
+        }
+    }
+}
+
+/// Active post-processing profile: explicit setting wins, otherwise the
+/// foreground app decides (J-04/J-05), defaulting to Mail.
+fn resolve_profile() -> flowcore::Profile {
+    let pref = flowcore::Profile::parse(&std::env::var("FLOWVOICE_PROFILE").unwrap_or_default());
+    pref.resolve(&crate::win::foreground_title())
 }
 
 /// Format every whisper segment as its own sentence and join them.
 /// Segments track utterance boundaries, so each one gets its own terminal
 /// mark ("…скрипт. Хочу…"); filler-only fragments format to empty and drop.
+/// Raw mode returns the segments untouched.
 fn format_segments(raw: Vec<String>) -> String {
+    if is_raw() {
+        return raw.join(" ");
+    }
+    if resolve_profile() == flowcore::Profile::Code {
+        return raw
+            .into_iter()
+            .map(|seg| flowcore::format_code(&seg))
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+    }
+    let explicit = std::env::var("FLOWVOICE_LANG").ok();
     raw.into_iter()
         .map(|seg| {
-            let lang = Language::detect(&seg);
+            let lang = flowcore::Language::resolve(explicit.as_deref(), &seg);
             flowcore::format(&seg, lang)
         })
         .filter(|s| !s.is_empty())
@@ -197,6 +367,26 @@ fn recognize_with(model: &Model, pcm16k: &[i16]) -> Result<String, String> {
     Ok(transcript(&completed))
 }
 
+/// Last finalized replica (for `замени`/`перепиши` context).
+fn last_replica_text() -> String {
+    crate::state::get()
+        .and_then(|s| s.last_text.lock().ok().map(|t| t.clone()))
+        .unwrap_or_default()
+}
+
+/// Stash pre-edit text for `отмени` (J-15).
+fn set_undo_slot(prev: String) {
+    if let Some(s) = crate::state::get() {
+        if let Ok(mut slot) = s.undo_slot.lock() {
+            *slot = Some(prev);
+        }
+    }
+}
+
+fn take_undo_slot() -> Option<String> {
+    crate::state::get().and_then(|s| s.undo_slot.lock().ok().and_then(|mut slot| slot.take()))
+}
+
 fn transcript(result: &CompleteResult<'_>) -> String {
     match result {
         CompleteResult::Single(single) => single.text.trim().to_string(),
@@ -208,14 +398,196 @@ fn transcript(result: &CompleteResult<'_>) -> String {
     }
 }
 
-/// Record mono 16-bit PCM from the default input device until the key is up.
+/// Case-insensitive substring match for `--device`/`FLOWVOICE_DEVICE`.
+fn device_matches(name: &str, want: &str) -> bool {
+    name.to_lowercase().contains(&want.to_lowercase())
+}
+
+/// Transcribe one audio file without a microphone (N-01..N-05, Y-01).
+/// `path` may be `-` for stdin bytes (Y-08). Groq accepts wav/mp3/m4a/
+/// ogg/flac/webm; the local/Vosk engines only take WAV (converted to
+/// 16 kHz mono on the fly, N-06/N-07).
+pub fn transcribe_file(path: &str, opts: &crate::FileOpts) -> Result<String, String> {
+    let (bytes, fname) = read_audio_input(path)?;
+    if bytes.is_empty() {
+        return Err("empty audio input (0 bytes)".to_string());
+    }
+    let pref = pref();
+    let engine = crate::backend::select(
+        pref,
+        crate::groq::available(),
+        crate::whisper::available(),
+        true,
+    )
+    .map_err(|e| e.to_string())?;
+    set_label(engine.label());
+
+    let spans = match engine {
+        crate::backend::Backend::Groq => {
+            let tmp = stage_temp(&bytes, &fname)?;
+            let out = crate::groq::transcribe_file(&tmp);
+            let _ = std::fs::remove_file(&tmp);
+            out?
+        }
+        crate::backend::Backend::Local | crate::backend::Backend::Vosk => {
+            if !is_wav_name(&fname) {
+                return Err(format!(
+                    "local engines need WAV; set GROQ_API_KEY for {fname} or convert it first"
+                ));
+            }
+            let (pcm, rate) = crate::whisper::decode_wav(&bytes)?;
+            let pcm16k = resample_to_16k(&pcm, rate);
+            match engine {
+                crate::backend::Backend::Local => crate::whisper::transcribe_pcm(&pcm16k)?
+                    .into_iter()
+                    .map(|text| crate::whisper::Span {
+                        text,
+                        start: 0.0,
+                        end: 0.0,
+                    })
+                    .collect(),
+                _ => {
+                    let model = model_instance()?;
+                    let raw = recognize_with(model, &pcm16k)?;
+                    vec![crate::whisper::Span {
+                        text: raw,
+                        start: 0.0,
+                        end: 0.0,
+                    }]
+                }
+            }
+        }
+    };
+    let out = render_spans(&spans, opts);
+    if opts.save && path != "-" {
+        let txt = std::path::Path::new(path).with_extension("txt");
+        std::fs::write(&txt, &out).map_err(|e| format!("cannot write {}: {e}", txt.display()))?;
+    }
+    Ok(out)
+}
+
+/// Render segments: per-sentence formatting, optional `[mm:ss]` prefixes
+/// (N-13), joined with spaces.
+fn render_spans(spans: &[crate::whisper::Span], opts: &crate::FileOpts) -> String {
+    let explicit = std::env::var("FLOWVOICE_LANG").ok();
+    let mut parts = Vec::with_capacity(spans.len());
+    for span in spans {
+        let formatted = if is_raw() {
+            span.text.clone()
+        } else {
+            let lang = flowcore::Language::resolve(explicit.as_deref(), &span.text);
+            flowcore::format(&span.text, lang)
+        };
+        if formatted.trim().is_empty() {
+            continue;
+        }
+        if opts.timestamps && span.end > span.start {
+            parts.push(format!(
+                "[{:02}:{:04.1}] {formatted}",
+                (span.start / 60.0) as u32,
+                span.start % 60.0
+            ));
+        } else {
+            parts.push(formatted);
+        }
+    }
+    parts.join(" ")
+}
+
+/// Batch-transcribe a directory of audio files (N-09, Y-09).
+/// Progress goes to stderr (Y-15); each result is printed and, with
+/// `--save`, stored next to its input (N-12). One bad file never stops
+/// the batch: it is reported and skipped.
+pub fn transcribe_dir(dir: &str, opts: &crate::FileOpts) -> Result<usize, String> {
+    const EXTS: &[&str] = &["wav", "mp3", "m4a", "ogg", "flac", "webm"];
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| format!("cannot list {dir}: {e}"))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.extension()
+                .and_then(|x| x.to_str())
+                .map(|x| EXTS.contains(&x.to_ascii_lowercase().as_str()))
+                .unwrap_or(false)
+        })
+        .collect();
+    files.sort();
+    if files.is_empty() {
+        return Err(format!("no audio files in {dir}"));
+    }
+    let mut done = 0usize;
+    for (i, path) in files.iter().enumerate() {
+        eprintln!("[{}/{}] {}", i + 1, files.len(), path.display());
+        match transcribe_file(&path.to_string_lossy(), opts) {
+            Ok(out) => {
+                done += 1;
+                println!("{out}");
+            }
+            Err(e) => eprintln!("skip {}: {e}", path.display()),
+        }
+    }
+    Ok(done)
+}
+
+fn read_audio_input(path: &str) -> Result<(Vec<u8>, String), String> {
+    if path == "-" {
+        use std::io::Read as _;
+        let mut buf = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut buf)
+            .map_err(|e| format!("stdin: {e}"))?;
+        return Ok((buf, "stdin.wav".to_string()));
+    }
+    std::fs::read(path)
+        .map(|b| {
+            let name = std::path::Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("input.wav")
+                .to_string();
+            (b, name)
+        })
+        .map_err(|e| format!("cannot read {path}: {e} (N-14)"))
+}
+
+fn stage_temp(bytes: &[u8], fname: &str) -> Result<std::path::PathBuf, String> {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let safe: String = fname
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let path = std::env::temp_dir().join(format!("flowvoice-file-{n}-{safe}"));
+    std::fs::write(&path, bytes).map_err(|e| format!("cannot stage file: {e}"))?;
+    Ok(path)
+}
+
+fn is_wav_name(fname: &str) -> bool {
+    fname.to_ascii_lowercase().ends_with(".wav")
+}
+
+/// Record mono 16-bit PCM from the chosen input device until the key is up.
+/// `FLOWVOICE_DEVICE` substring selects a non-default microphone (Y-05).
 fn capture_until_stop() -> Result<(Vec<i16>, u32), String> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
     let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| "no default audio input device".to_string())?;
+    let wanted = std::env::var("FLOWVOICE_DEVICE").ok();
+    let device = match wanted {
+        Some(want) => host
+            .input_devices()
+            .map_err(|e| format!("cannot list input devices: {e}"))?
+            .find(|d| d.name().map(|n| device_matches(&n, &want)).unwrap_or(false))
+            .ok_or_else(|| format!("no input device matching `{want}`"))?,
+        None => host
+            .default_input_device()
+            .ok_or_else(|| "no default audio input device".to_string())?,
+    };
 
     let supported = device
         .default_input_config()
@@ -355,4 +727,60 @@ fn resample_to_16k(input: &[i16], rate: u32) -> Vec<i16> {
         out.push(v.round().clamp(-32768.0, 32767.0) as i16);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_match_is_case_insensitive_substring() {
+        assert!(device_matches("Microphone (USB Audio)", "usb"));
+        assert!(device_matches("Микрофон", "МИКРО"));
+        assert!(!device_matches("Speakers", "mic"));
+    }
+
+    #[test]
+    fn brackets_without_digits_vanish() {
+        assert_eq!(strip_brackets("привет [музыка] мир"), "привет мир");
+        assert_eq!(strip_brackets("а (смеётся) б"), "а б");
+        assert_eq!(
+            strip_brackets("позвони (712) 555-01-01 завтра"),
+            "позвони (712) 555-01-01 завтра"
+        );
+        assert_eq!(strip_brackets("без закрытия"), "без закрытия");
+    }
+
+    #[test]
+    fn render_adds_timestamps() {
+        let spans = vec![
+            crate::whisper::Span {
+                text: "привет".to_string(),
+                start: 61.5,
+                end: 63.0,
+            },
+            crate::whisper::Span {
+                text: "мир".to_string(),
+                start: 0.0,
+                end: 0.0,
+            },
+        ];
+        let opts = crate::FileOpts {
+            save: false,
+            timestamps: true,
+            json: false,
+        };
+        let out = render_spans(&spans, &opts);
+        assert!(out.starts_with("[01:01.5] Привет."), "{out}");
+        assert!(out.contains("Мир."), "{out}");
+    }
+
+    #[test]
+    fn resample_passthrough_and_ratio() {
+        assert_eq!(resample_to_16k(&[], 44100), Vec::<i16>::new());
+        let src = vec![0i16, 1000, 2000, 3000];
+        assert_eq!(resample_to_16k(&src, 16_000), src);
+        let up = resample_to_16k(&[0i16, 1000], 8000);
+        assert_eq!(up.len(), 4);
+    }
 }

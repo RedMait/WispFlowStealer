@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Russian punctuation + capitalization restoration.
 //!
 //! Runs the `RUPunct/RUPunct_small` INT8 ONNX model with the pure-Rust

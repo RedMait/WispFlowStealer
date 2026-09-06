@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 # Downloads the runtime assets needed by the audio (mic dictation) mode:
 #   * native/vosk.dll  - Vosk speech recognition library (Windows x64, fallback)
 #   * models/ru        - FULL Russian Vosk model vosk-model-ru-0.42 (~1.8 GB,
@@ -30,13 +31,28 @@ $PunctBase = "https://huggingface.co/ekhodzitsky/rupunct-small-onnx/resolve/main
 New-Item -ItemType Directory -Force -Path $NativeDir, $ModelsDir | Out-Null
 
 function Save-Url([string]$Url, [string]$Out) {
-    if (Test-Path $Out) { return }
+    $hashFile = "$Out.sha256"
+    if ((Test-Path $Out) -and (Test-Path $hashFile)) {
+        $want = (Get-Content -LiteralPath $hashFile -TotalCount 1).Split(" ")[0]
+        $got = (Get-FileHash -LiteralPath $Out -Algorithm SHA256).Hash.ToLower()
+        if ($got -eq $want.ToLower()) {
+            Write-Host "  verified: $([System.IO.Path]::GetFileName($Out))"
+            return
+        }
+        Write-Host "  hash mismatch, re-downloading $([System.IO.Path]::GetFileName($Out)) ..."
+        Remove-Item -LiteralPath $Out -Force
+    } elseif (Test-Path $Out) {
+        return
+    }
     Write-Host "  downloading $([System.IO.Path]::GetFileName($Out)) ..."
-    & curl.exe -fSL --retry 3 -o $Out -- $Url
+    # -C - resumes interrupted downloads (AM-14); -fSL fails loudly on HTTP errors.
+    & curl.exe -fSL -C - --retry 3 -o $Out -- $Url
     if ($LASTEXITCODE -ne 0) {
         Remove-Item -LiteralPath $Out -ErrorAction SilentlyContinue
         throw "curl failed for $Url (exit $LASTEXITCODE)"
     }
+    $hash = (Get-FileHash -LiteralPath $Out -Algorithm SHA256).Hash.ToLower()
+    Set-Content -LiteralPath $hashFile -Value "$hash  $([System.IO.Path]::GetFileName($Out))" -NoNewline
 }
 
 function Add-Model([string]$ZipName, [string]$Dest) {

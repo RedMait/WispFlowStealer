@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Pure, dependency-free text post-processing engine.
 //!
 //! Replicates the writing "magic" of Wispr-like dictation assistants:
@@ -31,6 +32,16 @@ impl Language {
             Language::Ru
         } else {
             Language::En
+        }
+    }
+
+    /// Explicit user choice wins (`FLOWVOICE_LANG`), otherwise auto-detect.
+    /// A fixed language setting disables auto-detection (I-07).
+    pub fn resolve(explicit: Option<&str>, text: &str) -> Language {
+        match explicit.map(|s| s.to_ascii_lowercase()).as_deref() {
+            Some("ru") | Some("russian") | Some("rus") => Language::Ru,
+            Some("en") | Some("english") | Some("eng") => Language::En,
+            _ => Language::detect(text),
         }
     }
 
@@ -745,6 +756,182 @@ pub fn clean(raw: &str, lang: Language) -> String {
         }
     }
     words.join(" ")
+}
+
+/// Words in a bare transcript. Short texts (`<= 10` words) skip the neural
+/// punctuator in favor of deterministic rules (J-09).
+pub fn word_count(text: &str) -> usize {
+    text.split_whitespace().count()
+}
+
+/// Post-processing profile (J-01/J-02/J-04/J-05): how much the pipeline may
+/// reshape a replica. `Auto` resolves from the foreground app title.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Profile {
+    Auto,
+    Chat,
+    Mail,
+    Code,
+}
+
+impl Profile {
+    pub fn parse(s: &str) -> Self {
+        // Full Unicode lowercase: aliases include Cyrillic ("ПОЧТА").
+        match s.to_lowercase().as_str() {
+            "chat" | "messenger" | "мессенджер" => Self::Chat,
+            "mail" | "post" | "почта" => Self::Mail,
+            "code" | "код" => Self::Code,
+            _ => Self::Auto,
+        }
+    }
+
+    /// Guess the profile from a foreground window title (J-04).
+    pub fn detect(app_title: &str) -> Self {
+        let t = app_title.to_lowercase();
+        const CHAT: &[&str] = &["telegram", "whatsapp", "discord", "slack", "skype", "viber"];
+        const MAIL: &[&str] = &["outlook", "thunderbird", "gmail", "mail", "почта"];
+        const CODE: &[&str] = &[
+            "visual studio",
+            "vscode",
+            "idea",
+            "pycharm",
+            "terminal",
+            "powershell",
+            "cmd",
+            "neovim",
+            "vim",
+        ];
+        if CHAT.iter().any(|k| t.contains(k)) {
+            Self::Chat
+        } else if MAIL.iter().any(|k| t.contains(k)) {
+            Self::Mail
+        } else if CODE.iter().any(|k| t.contains(k)) {
+            Self::Code
+        } else {
+            Self::Mail
+        }
+    }
+
+    /// Resolve `Auto` through the app title; explicit choice wins (J-05).
+    pub fn resolve(self, app_title: &str) -> Self {
+        match self {
+            Self::Auto => Self::detect(app_title),
+            other => other,
+        }
+    }
+}
+
+/// Code-dictation formatting (J-03): keep identifiers verbatim — no filler
+/// removal, no case changes, no appended terminal mark. Only whitespace is
+/// tidied and repeats collapsed.
+pub fn format_code(raw: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for w in raw.split_whitespace() {
+        if let Some(last) = out.last() {
+            if last.eq_ignore_ascii_case(w) {
+                continue;
+            }
+        }
+        out.push(w.to_string());
+    }
+    out.join(" ")
+}
+
+/// Leading separator between consecutive replicas (AM-03): with the option
+/// on, an alphanumeric start gains one leading space so back-to-back
+/// pastes don't glue words together.
+pub fn pad_replica_start(text: &str, enabled: bool) -> String {
+    if enabled {
+        if let Some(c) = text.chars().next() {
+            if c.is_alphanumeric() {
+                return format!(" {text}");
+            }
+        }
+    }
+    text.to_string()
+}
+
+/// Crude Russian→Latin transliteration for the `транслит:` voice command
+/// (I-08). Offline lookup table, no model involved.
+pub fn transliterate_ru(text: &str) -> String {
+    fn map(c: char) -> &'static str {
+        match c {
+            'а' => "a",
+            'б' => "b",
+            'в' => "v",
+            'г' => "g",
+            'д' => "d",
+            'е' | 'ё' => "e",
+            'ж' => "zh",
+            'з' => "z",
+            'и' => "i",
+            'й' => "y",
+            'к' => "k",
+            'л' => "l",
+            'м' => "m",
+            'н' => "n",
+            'о' => "o",
+            'п' => "p",
+            'р' => "r",
+            'с' => "s",
+            'т' => "t",
+            'у' => "u",
+            'ф' => "f",
+            'х' => "kh",
+            'ц' => "ts",
+            'ч' => "ch",
+            'ш' => "sh",
+            'щ' => "shch",
+            'ъ' | 'ь' => "",
+            'ы' => "y",
+            'э' => "e",
+            'ю' => "yu",
+            'я' => "ya",
+            'А' => "A",
+            'Б' => "B",
+            'В' => "V",
+            'Г' => "G",
+            'Д' => "D",
+            'Е' | 'Ё' => "E",
+            'Ж' => "Zh",
+            'З' => "Z",
+            'И' => "I",
+            'Й' => "Y",
+            'К' => "K",
+            'Л' => "L",
+            'М' => "M",
+            'Н' => "N",
+            'О' => "O",
+            'П' => "P",
+            'Р' => "R",
+            'С' => "S",
+            'Т' => "T",
+            'У' => "U",
+            'Ф' => "F",
+            'Х' => "Kh",
+            'Ц' => "Ts",
+            'Ч' => "Ch",
+            'Ш' => "Sh",
+            'Щ' => "Shch",
+            'Ъ' | 'Ь' => "",
+            'Ы' => "Y",
+            'Э' => "E",
+            'Ю' => "Yu",
+            'Я' => "Ya",
+            _ => "",
+        }
+    }
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_ascii() {
+            out.push(c);
+        } else if matches!(c, 'а'..='я' | 'А'..='Я' | 'ё' | 'Ё') {
+            out.push_str(map(c));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Convenience wrapper around [`format`] that auto-detects the language.

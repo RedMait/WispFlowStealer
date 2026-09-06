@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Windows-only implementation of the hold-to-talk UX using raw WinAPI.
 //!
 //! A low-level keyboard hook (`WH_KEYBOARD_LL`) detects when the hotkey is
@@ -9,18 +10,20 @@ use std::os::raw::{c_int, c_void};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
 #[cfg(any(feature = "audio", feature = "gui"))]
-use crate::state::{self, AppState};
+use crate::state::self;
+#[cfg(feature = "audio")]
+use crate::state::AppState;
 
 const WH_KEYBOARD_LL: c_int = 13;
 const WM_KEYDOWN: u32 = 0x0100;
 const WM_SYSKEYDOWN: u32 = 0x0104;
 const WM_QUIT: u32 = 0x0012;
 
-#[cfg(feature = "audio")]
+#[cfg(any(feature = "audio", feature = "gui"))]
 const KEYEVENTF_KEYUP: u32 = 0x0002;
-#[cfg(feature = "audio")]
+#[cfg(any(feature = "audio", feature = "gui"))]
 const VK_CONTROL: u16 = 0x11;
-#[cfg(feature = "audio")]
+#[cfg(any(feature = "audio", feature = "gui"))]
 const VK_V: u16 = 0x56;
 const VK_F7: u16 = 0x76;
 const VK_F8: u16 = 0x77;
@@ -42,7 +45,13 @@ unsafe extern "system" {
     fn DispatchMessageW(msg: *const Msg) -> isize;
     fn GetModuleHandleW(name: *const u16) -> *const c_void;
     fn GetLastError() -> u32;
-    #[cfg(feature = "audio")]
+    #[cfg(any(feature = "audio", feature = "gui"))]
+    fn GetForegroundWindow() -> *const c_void;
+    #[cfg(any(feature = "audio", feature = "gui"))]
+    fn GetWindowTextW(hwnd: *const c_void, text: *mut u16, max: c_int) -> c_int;
+    fn OpenInputDesktop(flags: u32, inherit: c_int, access: u32) -> *const c_void;
+    fn CloseDesktop(handle: *const c_void) -> c_int;
+    #[cfg(any(feature = "audio", feature = "gui"))]
     fn keybd_event(b_vk: u8, b_scan: u8, dw_flags: u32, dw_extra: usize);
 }
 
@@ -52,6 +61,12 @@ unsafe extern "system" {
     fn GetConsoleWindow() -> *const c_void;
     fn AttachConsole(process_id: u32) -> c_int;
     fn AllocConsole() -> c_int;
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn CreateMutexW(attrs: *const c_void, owned: c_int, name: *const u16) -> *const c_void;
+    fn Beep(freq: u32, duration_ms: u32) -> c_int;
 }
 
 #[link(name = "user32")]
@@ -85,6 +100,27 @@ static STOP: AtomicBool = AtomicBool::new(false);
 static ENABLED: AtomicBool = AtomicBool::new(true);
 /// When the hotkey was last released: start of the release→paste latency.
 static KEYUP_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+/// When the current capture started (for WPM over the audio span).
+#[cfg(any(feature = "audio", feature = "gui"))]
+static KEYDOWN_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// Foreground window title at the moment of the call (target app journal).
+/// Empty when unavailable (locked screen, elevated window, …).
+#[cfg(any(feature = "audio", feature = "gui"))]
+pub(crate) fn foreground_title() -> String {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() {
+            return String::new();
+        }
+        let mut buf = [0u16; 256];
+        let n = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as c_int);
+        if n <= 0 {
+            return String::new();
+        }
+        String::from_utf16_lossy(&buf[..n as usize])
+    }
+}
 
 /// Change the hotkey at runtime (GUI settings). Takes effect immediately.
 pub fn set_hotkey_vk(vk: u16) {
@@ -139,21 +175,77 @@ pub fn is_stop_requested() -> bool {
     STOP.load(Ordering::SeqCst)
 }
 
+/// Second copy exits with a message instead of fighting over the hotkey
+/// and the microphone (O-14).
+pub fn ensure_single_instance() -> bool {
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+    let name = wide("Local\\WispFlowStealer");
+    unsafe {
+        CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+        GetLastError() != 183 // ERROR_ALREADY_EXISTS
+    }
+}
+
+/// True on a locked workstation / secure desktop: hotkeys must not record
+/// there (AG-07/AG-08). `OpenInputDesktop` fails when the default desktop
+/// is not interactive.
+pub fn workstation_locked() -> bool {
+    const GENERIC_READ: u32 = 0x80000000;
+    unsafe {
+        let h = OpenInputDesktop(0, 0, GENERIC_READ);
+        if h.is_null() {
+            return true;
+        }
+        CloseDesktop(h);
+        false
+    }
+}
+
+/// Sound signals on/off (`FLOWVOICE_SOUND=0` disables, AG-06).
+fn sound_on() -> bool {
+    std::env::var("FLOWVOICE_SOUND")
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true)
+}
+
+fn beep(freq: u32, ms: u32) {
+    if sound_on() {
+        unsafe {
+            Beep(freq, ms);
+        }
+    }
+}
+
+/// Error signal: distinct low tone (AG-15).
+#[cfg(feature = "audio")]
+pub fn beep_error() {
+    beep(220, 200);
+}
+
 extern "system" fn hook_proc(code: c_int, w_param: usize, l_param: isize) -> isize {
-    if code >= 0 && ENABLED.load(Ordering::SeqCst) {
+    if code >= 0 && !workstation_locked() {
         // KBDLLHOOKSTRUCT starts with vkCode: u32, scanCode: u32, ...
         let vk = unsafe { *(l_param as *const u32) } as u16;
-        let hotkey = HOTKEY.load(Ordering::SeqCst);
-
-        if vk == hotkey {
-            let down = w_param == WM_KEYDOWN as usize || w_param == WM_SYSKEYDOWN as usize;
-            if down {
-                if !RECORDING.swap(true, Ordering::SeqCst) {
-                    handle_keydown();
-                }
-            } else if RECORDING.swap(false, Ordering::SeqCst) {
-                handle_keyup();
-            }
+        let down = w_param == WM_KEYDOWN as usize || w_param == WM_SYSKEYDOWN as usize;
+        let ev = if down {
+            crate::hotkey::HotkeyEvent::Press { vk }
+        } else {
+            crate::hotkey::HotkeyEvent::Release { vk }
+        };
+        // The transition table is pure and unit-tested (`hotkey::decide`).
+        let (next, action) = crate::hotkey::decide(
+            RECORDING.load(Ordering::SeqCst),
+            ENABLED.load(Ordering::SeqCst),
+            HOTKEY.load(Ordering::SeqCst),
+            ev,
+        );
+        RECORDING.store(next, Ordering::SeqCst);
+        match action {
+            crate::hotkey::HotkeyAction::Start => handle_keydown(),
+            crate::hotkey::HotkeyAction::Stop => handle_keyup(),
+            crate::hotkey::HotkeyAction::Ignore => {}
         }
     }
     unsafe { CallNextHookEx(0, code, w_param, l_param) }
@@ -161,6 +253,7 @@ extern "system" fn hook_proc(code: c_int, w_param: usize, l_param: isize) -> isi
 
 fn handle_keydown() {
     STOP.store(false, Ordering::SeqCst);
+    beep(880, 90);
     #[cfg(any(feature = "audio", feature = "gui"))]
     state::emit("[listening] hold the key and speak...");
     #[cfg(not(any(feature = "audio", feature = "gui")))]
@@ -169,14 +262,21 @@ fn handle_keydown() {
         let _ = std::io::stdout().flush();
     }
     #[cfg(any(feature = "audio", feature = "gui"))]
-    if let Some(s) = state::get() {
-        s.set_recording(true);
+    {
+        if let Some(s) = state::get() {
+            s.set_recording(true);
+        }
+        if let Ok(mut slot) = KEYDOWN_AT.lock() {
+            *slot = Some(std::time::Instant::now());
+        }
+        state::write_pending();
     }
     std::thread::spawn(spawn_recorder);
 }
 
 fn handle_keyup() {
     STOP.store(true, Ordering::SeqCst);
+    beep(660, 90);
     if let Ok(mut slot) = KEYUP_AT.lock() {
         *slot = Some(std::time::Instant::now());
     }
@@ -188,8 +288,8 @@ fn spawn_recorder() {
         let finish_with = |text: String, state: Option<std::sync::Arc<AppState>>| {
             if let Some(s) = state {
                 s.set_recording(false);
-                if !text.is_empty() {
-                    s.push_history(text.clone());
+                if !text.is_empty() && !no_history() {
+                    s.push_history(text.clone(), foreground_title());
                     if let Ok(mut last) = s.last_text.lock() {
                         *last = text.clone();
                     }
@@ -201,6 +301,7 @@ fn spawn_recorder() {
         match crate::audio::transcribe() {
             Ok(text) => finish_with(text, shared),
             Err(e) => {
+                beep_error();
                 state::emit(&format!("[error] {e}"));
                 if let Some(s) = &shared {
                     s.set_recording(false);
@@ -227,27 +328,45 @@ fn finish(text: &str) {
         return;
     }
 
+    // Optional separator so back-to-back replicas don't glue (AM-03).
+    let spaced = std::env::var("FLOWVOICE_LEADING_SPACE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let text = flowcore::pad_replica_start(text, spaced);
     state::emit(&format!("[final] {text}"));
-    paste(text);
+    paste(&text);
 }
 
-#[cfg(feature = "audio")]
 /// Copy the text to the clipboard and simulate Ctrl+V. Pasting is the
 /// fastest way to enter arbitrary Unicode text reliably.
-fn paste(text: &str) {
-    #[cfg(feature = "audio")]
-    {
-        let mut cb = match arboard::Clipboard::new() {
-            Ok(cb) => cb,
-            Err(e) => {
-                state::emit(&format!("[error] cannot open clipboard: {e}"));
-                return;
-            }
-        };
-        if let Err(e) = cb.set_text(text) {
-            state::emit(&format!("[error] cannot write clipboard: {e}"));
-            return;
+///
+/// Returns keyup→paste seconds (0 when unknown). The user's clipboard is
+/// restored afterwards (L-01); failures are reported, never silent.
+#[cfg(any(feature = "audio", feature = "gui"))]
+pub(crate) fn paste(text: &str) -> f32 {
+    // Optional pause before pasting (AM-20 `FLOWVOICE_PASTE_DELAY_MS`).
+    let delay_ms: u64 = std::env::var("FLOWVOICE_PASTE_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if delay_ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms.min(5000)));
+    }
+
+    // Remember the user's clipboard: text, or None when empty/unreadable.
+    let mut cb = match arboard::Clipboard::new() {
+        Ok(cb) => cb,
+        Err(e) => {
+            state::emit(&format!(
+                "[error] cannot open clipboard ({e}); text kept in history, paste it manually"
+            ));
+            return 0.0;
         }
+    };
+    let saved = cb.get_text().ok();
+    if let Err(e) = cb.set_text(text) {
+        state::emit(&format!("[error] cannot write clipboard ({e})"));
+        return 0.0;
     }
 
     unsafe {
@@ -258,20 +377,101 @@ fn paste(text: &str) {
     }
 
     // Latency from hotkey release to the finished paste, straight to the log.
-    if let Ok(mut slot) = KEYUP_AT.lock() {
-        if let Some(t0) = slot.take() {
-            state::emit(&format!(
-                "[timing] {:.1}s keyup->paste",
-                t0.elapsed().as_secs_f32()
-            ));
-        }
+    // The release instant is taken once and shared with the journal below.
+    let keyup = KEYUP_AT.lock().ok().and_then(|mut slot| slot.take());
+    let keydown = KEYDOWN_AT.lock().ok().and_then(|mut slot| slot.take());
+    let secs = keyup.map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0);
+    if keyup.is_some() {
+        state::emit(&format!("[timing] {secs:.1}s keyup->paste"));
     }
+
+    // Restore what the user had (L-01); empty stays empty (L-04).
+    // Best-effort: a busy clipboard only costs the restore, never the paste.
+    let restore_ms: u64 = std::env::var("FLOWVOICE_RESTORE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(400);
+    if restore_ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(restore_ms.min(5000)));
+        let _ = match saved {
+            Some(prev) => cb.set_text(prev),
+            None => cb.clear(),
+        };
+    }
+
+    journal_append(text, secs, keydown, keyup, "paste");
+    state::clear_pending();
+    secs
+}
+
+/// Append one journal line for a pasted replica (skipped in no-history
+/// mode alongside the visible history).
+#[cfg(any(feature = "audio", feature = "gui"))]
+fn journal_append(
+    text: &str,
+    secs: f32,
+    keydown: Option<std::time::Instant>,
+    keyup: Option<std::time::Instant>,
+    method: &str,
+) {
+    if no_history() {
+        return;
+    }
+    let Some(s) = state::get() else {
+        return;
+    };
+    let audio_secs = match (keydown, keyup) {
+        (Some(a), Some(b)) if b >= a => (b - a).as_secs_f32(),
+        _ => 0.0,
+    };
+    let now = std::time::SystemTime::now();
+    let nanos = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let words = text.split_whitespace().count();
+    let entry = crate::journal::Entry {
+        id: crate::journal::make_id(nanos),
+        ts: (nanos / 1_000_000_000) as u64,
+        backend: s
+            .backend_label
+            .lock()
+            .map(|b| b.clone())
+            .unwrap_or_default(),
+        lang: flowcore::Language::detect(text).to_string(),
+        app: foreground_title(),
+        chars: text.chars().count(),
+        words,
+        secs,
+        wpm: crate::journal::wpm(words, audio_secs),
+        audio_secs,
+        method: method.to_string(),
+    };
+    if let Err(e) = crate::journal::append(&state::journal_path(), &entry) {
+        state::emit(&format!("[error] journal append failed: {e}"));
+    }
+}
+
+/// Privacy mode (`FLOWVOICE_NO_HISTORY=1`): no history, no journal (P-12).
+#[cfg(any(feature = "audio", feature = "gui"))]
+fn no_history() -> bool {
+    std::env::var("FLOWVOICE_NO_HISTORY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 /// Install the low-level keyboard hook and pump messages until quit.
 /// Blocks the calling thread; GUI mode runs the pump on a background
 /// thread via [`spawn_pump`].
 pub fn run(hotkey: Hotkey) {
+    if !ensure_single_instance() {
+        eprintln!("flowvoice is already running (single instance)");
+        std::process::exit(1);
+    }
+    #[cfg(any(feature = "audio", feature = "gui"))]
+    if let Some(msg) = state::take_pending_notice() {
+        state::emit(&msg);
+    }
     set_hotkey_vk(hotkey.to_vk());
 
     // Warm up the speech + punctuation models in the background so the

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use flowcore::{classify, format, format_raw, Language, SentenceKind};
 
 fn ru(raw: &str) -> String {
@@ -188,6 +189,54 @@ fn adjacent_marks_collapse_and_sentences_case() {
     // Ellipsis and decimal numbers survive.
     assert_eq!(ru("ждал... и вот"), "Ждал... И вот.");
     assert_eq!(ru("версия 3.14 вышла"), "Версия 3.14 вышла.");
+}
+
+#[test]
+fn profiles_shape_output() {
+    use flowcore::Profile;
+    assert_eq!(Profile::parse("chat"), Profile::Chat);
+    assert_eq!(Profile::parse("ПОЧТА"), Profile::Mail);
+    assert_eq!(Profile::parse("code"), Profile::Code);
+    assert_eq!(Profile::parse(""), Profile::Auto);
+    assert_eq!(Profile::resolve(Profile::Chat, "Telegram"), Profile::Chat);
+    assert_eq!(
+        Profile::resolve(Profile::Auto, "Telegram Desktop"),
+        Profile::Chat
+    );
+    assert_eq!(
+        Profile::resolve(Profile::Auto, "Inbox - Outlook"),
+        Profile::Mail
+    );
+    assert_eq!(
+        Profile::resolve(Profile::Auto, "main.rs - Visual Studio Code"),
+        Profile::Code
+    );
+    assert_eq!(
+        Profile::resolve(Profile::Auto, "Untitled Notepad"),
+        Profile::Mail
+    );
+    assert_eq!(
+        flowcore::format_code("удали  типа  вот этот  этот thunk"),
+        "удали типа вот этот thunk"
+    );
+    assert_eq!(flowcore::format_code("  spaced   out  "), "spaced out");
+    assert_eq!(flowcore::pad_replica_start("привет", true), " привет");
+    assert_eq!(flowcore::pad_replica_start("привет", false), "привет");
+    assert_eq!(flowcore::pad_replica_start(", привет", true), ", привет");
+}
+
+#[test]
+fn language_resolve_prefers_explicit_choice() {
+    use flowcore::{word_count, Language};
+    assert_eq!(Language::resolve(Some("ru"), "hello world"), Language::Ru);
+    assert_eq!(Language::resolve(Some("EN"), "привет мир"), Language::En);
+    assert_eq!(Language::resolve(None, "привет мир"), Language::Ru);
+    assert_eq!(Language::resolve(Some("auto"), "hello"), Language::En);
+    assert_eq!(Language::resolve(Some("nonsense"), "привет"), Language::Ru);
+    assert_eq!(word_count("  раз два  три "), 3);
+    assert_eq!(word_count(""), 0);
+    assert_eq!(flowcore::transliterate_ru("Привет, мир!"), "Privet, mir!");
+    assert_eq!(flowcore::transliterate_ru("Щука Ёж"), "Shchuka Ezh");
 }
 
 #[test]

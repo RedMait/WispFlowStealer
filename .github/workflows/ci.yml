@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 name: CI
 
 on:
@@ -28,8 +29,45 @@ jobs:
       - name: Lint
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: No stubs (todo!/unimplemented!/fixme)
+        shell: pwsh
+        run: |
+          $hits = Get-ChildItem -Recurse -File -Include *.rs -Path crates,native |
+            Select-String -Pattern 'todo!|unimplemented!|fixme' -CaseSensitive:$false
+          if ($hits) { $hits | ForEach-Object { Write-Host $_ }; exit 1 }
+
       - name: Test
         run: cargo test --workspace
 
+      - name: Audio feature tests (Windows only)
+        if: matrix.os == 'windows-latest'
+        run: cargo test -p flowvoice --features audio
+
       - name: Build (release)
         run: cargo build --workspace --release
+
+  licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: License compatibility
+        run: cargo deny check licenses
+
+  coverage:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install tarpaulin
+        run: cargo install cargo-tarpaulin --locked
+      - name: Coverage (flowcore)
+        run: cargo tarpaulin -p flowcore --out Xml --output-dir coverage
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage/

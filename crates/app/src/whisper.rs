@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Whisper speech-to-text through a resident `whisper-server` process.
 //!
 //! The server is a prebuilt whisper.cpp binary (fetched by
@@ -64,6 +65,13 @@ fn port() -> u16 {
         .unwrap_or(DEFAULT_PORT)
 }
 
+/// Port candidates: the configured one plus two fallbacks, so an occupied
+/// port never blocks startup (O-13) — first answer wins, first silence spawns.
+fn candidate_ports() -> [u16; 3] {
+    let p = port();
+    [p, p.wrapping_add(1), p.wrapping_add(2)]
+}
+
 /// Recognition language (`FLOWVOICE_LANG`, default `ru`).
 /// Server `-l` flag and Groq `language` field both take ISO-639-1.
 pub(crate) fn lang() -> String {
@@ -84,9 +92,10 @@ static CHILD: Mutex<Option<Child>> = Mutex::new(None);
 /// The TCP probe is sub-millisecond, so calling this per utterance is free
 /// and self-healing (a dead server is simply respawned).
 pub fn ensure_server() -> Result<u16, String> {
-    let p = port();
-    if TcpStream::connect(("127.0.0.1", p)).is_ok() {
-        return Ok(p);
+    for p in candidate_ports() {
+        if TcpStream::connect(("127.0.0.1", p)).is_ok() {
+            return Ok(p);
+        }
     }
     let bin = server_bin();
     let model = model_file();
@@ -102,6 +111,15 @@ pub fn ensure_server() -> Result<u16, String> {
             model.display()
         ));
     }
+    // First silent port becomes ours.
+    let mut spawn_on: Option<u16> = None;
+    for p in candidate_ports() {
+        if TcpStream::connect(("127.0.0.1", p)).is_err() {
+            spawn_on = Some(p);
+            break;
+        }
+    }
+    let p = spawn_on.ok_or_else(|| "no free whisper port nearby".to_string())?;
 
     let mut cmd = Command::new(&bin);
     // A console child of a windowless parent would open a terminal window
@@ -117,8 +135,15 @@ pub fn ensure_server() -> Result<u16, String> {
         .arg("--port")
         .arg(p.to_string())
         .arg("-l")
-        .arg(lang())
-        .stdin(Stdio::null())
+        .arg(lang());
+    // CPU thread budget (AM-13 `FLOWVOICE_THREADS`); default is the
+    // server's own choice.
+    if let Ok(t) = std::env::var("FLOWVOICE_THREADS") {
+        if t.parse::<u32>().is_ok() {
+            cmd.arg("-t").arg(t);
+        }
+    }
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     // whisper.dll / ggml-*.dll sit next to the exe; run from its directory.
@@ -259,29 +284,116 @@ fn parse_inference_response(resp: &[u8]) -> Result<Vec<String>, String> {
     Ok(texts)
 }
 
+/// One transcript segment with optional time bounds (verbose_json).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Span {
+    pub text: String,
+    pub start: f32,
+    pub end: f32,
+}
+
 /// Split a `verbose_json`-style reply into trimmed non-empty segment texts.
 /// Shared with the Groq backend (same response shape).
 pub(crate) fn segment_texts(value: &serde_json::Value) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+    segment_spans(value).into_iter().map(|s| s.text).collect()
+}
+
+/// Same as [`segment_texts`], keeping per-segment times when present
+/// (missing bounds become 0.0; whole-text fallback becomes one span).
+pub(crate) fn segment_spans(value: &serde_json::Value) -> Vec<Span> {
+    let mut out: Vec<Span> = Vec::new();
     if let Some(segments) = value.get("segments").and_then(|s| s.as_array()) {
         for seg in segments {
-            if let Some(t) = seg.get("text").and_then(|t| t.as_str()) {
-                let t = t.trim().to_string();
-                if !t.is_empty() {
-                    out.push(t);
-                }
+            let text = seg
+                .get("text")
+                .and_then(|t| t.as_str())
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if text.is_empty() {
+                continue;
             }
+            out.push(Span {
+                text,
+                start: seg.get("start").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                end: seg.get("end").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+            });
         }
     }
     if out.is_empty() {
         if let Some(t) = value.get("text").and_then(|t| t.as_str()) {
-            let t = t.trim().to_string();
-            if !t.is_empty() {
-                out.push(t);
+            let text = t.trim().to_string();
+            if !text.is_empty() {
+                out.push(Span {
+                    text,
+                    start: 0.0,
+                    end: 0.0,
+                });
             }
         }
     }
     out
+}
+
+/// Decode PCM-16 WAV bytes (mono or stereo) into samples + sample rate.
+/// Anything else (MP3, float, …) is a clear error, not garbage (N-14).
+pub(crate) fn decode_wav(data: &[u8]) -> Result<(Vec<i16>, u32), String> {
+    let err = |m: &str| format!("bad wav: {m}");
+    if data.len() < 44 || &data[0..4] != b"RIFF" || &data[8..12] != b"WAVE" {
+        return Err(err("not a RIFF/WAVE file"));
+    }
+    // Walk chunks (fmt then data, in any order with extras skipped).
+    let mut pos = 12;
+    let mut channels: Option<u16> = None;
+    let mut rate: Option<u32> = None;
+    let mut bits: Option<u16> = None;
+    let mut audio_format: Option<u16> = None;
+    let mut samples: Option<Vec<i16>> = None;
+    while pos + 8 <= data.len() {
+        let id = &data[pos..pos + 4];
+        let size = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        let body = pos + 8;
+        let end = (body + size).min(data.len());
+        if id == b"fmt " && size >= 16 {
+            audio_format = Some(u16::from_le_bytes(data[body..body + 2].try_into().unwrap()));
+            channels = Some(u16::from_le_bytes(
+                data[body + 2..body + 4].try_into().unwrap(),
+            ));
+            rate = Some(u32::from_le_bytes(
+                data[body + 4..body + 8].try_into().unwrap(),
+            ));
+            bits = Some(u16::from_le_bytes(
+                data[body + 14..body + 16].try_into().unwrap(),
+            ));
+        } else if id == b"data" {
+            let mut pcm = Vec::with_capacity((end - body) / 2);
+            let mut i = body;
+            while i + 1 < end {
+                pcm.push(i16::from_le_bytes([data[i], data[i + 1]]));
+                i += 2;
+            }
+            samples = Some(pcm);
+        }
+        pos = end + (end % 2);
+    }
+    match (audio_format, channels, rate, bits, samples) {
+        (Some(1), Some(ch @ (1 | 2)), Some(rate), Some(16), Some(pcm)) => {
+            if ch == 2 {
+                // Downmix stereo to mono (N-07).
+                Ok((
+                    pcm.chunks_exact(2)
+                        .map(|f| ((f[0] as i32 + f[1] as i32) / 2) as i16)
+                        .collect(),
+                    rate,
+                ))
+            } else {
+                Ok((pcm, rate))
+            }
+        }
+        (Some(f), _, _, _, _) if f != 1 => Err(err("only PCM-16 supported")),
+        (_, _, _, _, None) => Err(err("no data chunk")),
+        _ => Err(err("unsupported format (want mono/stereo PCM-16)")),
+    }
 }
 
 #[cfg(test)]
@@ -328,6 +440,31 @@ mod tests {
     fn prefers_verbose_segments() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"text\":\"a b\",\"segments\":[{\"text\":\"  a. \"},{\"text\":\"\"},{\"text\":\"b?\"}]}";
         assert_eq!(parse_inference_response(raw).unwrap(), ["a.", "b?"]);
+    }
+
+    #[test]
+    fn wav_roundtrip_and_stereo_downmix() {
+        let mono = vec![0i16, 1000, -1000, 32767];
+        let wav = encode_wav(&mono);
+        assert_eq!(decode_wav(&wav).unwrap(), (mono, 16_000));
+        // Stereo interleaved L/R -> averaged mono.
+        let mut stereo = Vec::new();
+        for s in [1000i16, -1000, 2000, -2000] {
+            stereo.extend_from_slice(&s.to_le_bytes());
+            stereo.extend_from_slice(&s.to_le_bytes());
+        }
+        let mut hdr = wav[..44].to_vec();
+        hdr[22] = 2; // channels
+        let data_len = (stereo.len() as u32).to_le_bytes();
+        hdr[40..44].copy_from_slice(&data_len);
+        hdr[4..8].copy_from_slice(&(36 + stereo.len() as u32).to_le_bytes());
+        hdr.extend_from_slice(&stereo);
+        assert_eq!(
+            decode_wav(&hdr).unwrap(),
+            (vec![1000i16, -1000, 2000, -2000], 16_000)
+        );
+        assert!(decode_wav(b"RIFF....WAVEjunk").is_err());
+        assert!(decode_wav(b"definitely not audio").is_err());
     }
 
     #[test]

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 # Stamps assets/flowvoice.ico into the release exe (repeat after every
 # release rebuild, since linking drops the icon resource).
 # Refuses to run while the app is alive (Windows locks the running exe).
