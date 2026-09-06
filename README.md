@@ -34,6 +34,10 @@ hold Right Ctrl  ->  speak  ->  release  ->  "эм я тут подумал чт
   the pure-Rust `tract-onnx` runtime for utterances over 10 words.
 - **Voice commands**: `переведи:`, `сократи:`, `замени X на Y`, `перепиши`,
   `отмени`, `транслит:` (see `flowvoice --help`).
+- **Voice macros** (`%APPDATA%\WispFlowStealer\macros.json`): exact phrases
+  that press keys instead of dictating, e.g.
+  `[{"phrase": "сохрани", "keys": "ctrl+s"}]`. Combos: modifiers
+  (`ctrl/alt/shift/win`) + letter/digit/F1–F24/`enter`/`esc`/`tab`/arrows.
 - **Post profiles**: chat / mail / code, auto-detected from the active window.
 - **History + journal**: every replica stored locally with app, timings and
   WPM; JSONL/CSV export; per-replica JSON journal lines (schema: `docs/JOURNAL.md`).
@@ -136,8 +140,17 @@ always use the deterministic rules.
 | Vosk model dir | – | `FLOWVOICE_MODEL` | `models/ru` |
 | Punct model dir | – | `FLOWPUNCT_MODEL` | `models/punct` |
 | Mic substring | – | `FLOWVOICE_DEVICE` / `--device` | default device |
+| Edit hotkey | `edit_key` | `FLOWVOICE_EDIT_KEY` / `--edit-key` | off |
+| Autostart | `autostart` | – | off |
+| History encryption | `history_encrypt` | – | off |
+| Paste engine | `paste_method` | `FLOWVOICE_PASTE_METHOD` | `clipboard` |
 | Raw transcript | – | `FLOWVOICE_RAW` / `--raw` | off |
 | Privacy mode | – | `FLOWVOICE_NO_HISTORY` | off |
+| VAD level | – | `FLOWVOICE_VAD_LEVEL` | `200` |
+| Noise gate | `noise_gate` | `FLOWVOICE_NOISE_GATE` | off |
+| Min hold, ms | – | `FLOWVOICE_MIN_HOLD_MS` | `200` |
+| Min chars | – | `FLOWVOICE_MIN_CHARS` | `2` |
+| Numbers | – | `FLOWVOICE_NUMBERS` (`words`) | digits |
 | Paste delay, ms | – | `FLOWVOICE_PASTE_DELAY_MS` | `0` |
 | Clipboard restore, ms | – | `FLOWVOICE_RESTORE_MS` | `400` |
 | Groq timeout, s | – | `FLOWVOICE_TIMEOUT_S` | `180` |

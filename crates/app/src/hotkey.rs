@@ -47,6 +47,14 @@ pub fn decide(
     }
 }
 
+/// Minimum hold gate (D-10): taps shorter than `min_ms` never become
+/// replicas. Pure predicate; the threshold comes from
+/// `FLOWVOICE_MIN_HOLD_MS` (default 200).
+#[cfg(any(feature = "audio", test))]
+pub fn meets_min_hold(hold_ms: u64, min_ms: u64) -> bool {
+    hold_ms >= min_ms
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,5 +133,23 @@ mod tests {
         let (rec, action) = decide(rec, true, HOTKEY, HotkeyEvent::Press { vk: HOTKEY });
         assert!(rec);
         assert_eq!(action, HotkeyAction::Start);
+    }
+
+    #[test]
+    fn syskeydown_repeat_over_live_is_ignored() {
+        // OS-level auto-repeat arrives as SYSKEYDOWN; same table path.
+        assert_eq!(
+            decide(true, true, HOTKEY, HotkeyEvent::Press { vk: HOTKEY }),
+            (true, HotkeyAction::Ignore)
+        );
+    }
+
+    #[cfg(any(feature = "audio", test))]
+    #[test]
+    fn min_hold_gate() {
+        assert!(meets_min_hold(200, 200));
+        assert!(meets_min_hold(5000, 200));
+        assert!(!meets_min_hold(199, 200));
+        assert!(!meets_min_hold(0, 200));
     }
 }

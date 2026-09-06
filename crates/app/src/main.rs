@@ -16,6 +16,9 @@ mod command;
 mod hotkey;
 #[cfg(any(all(windows, any(feature = "audio", feature = "gui")), test))]
 mod journal;
+#[cfg(any(all(windows, feature = "audio"), test))]
+mod macros;
+mod util;
 
 #[cfg(all(windows, feature = "audio"))]
 mod audio;
@@ -59,6 +62,7 @@ fn main() {
     apply_env_flag(&args, "--lang", "FLOWVOICE_LANG");
     apply_env_flag(&args, "--backend", "FLOWVOICE_BACKEND");
     apply_env_flag(&args, "--device", "FLOWVOICE_DEVICE");
+    apply_env_flag(&args, "--edit-key", "FLOWVOICE_EDIT_KEY");
     if args.iter().any(|a| a == "--raw" || a == "--no-format") {
         std::env::set_var("FLOWVOICE_RAW", "1");
     }
@@ -349,6 +353,7 @@ fn print_help() {
     println!("  FLOWVOICE_SOUND=0  mute record beeps");
     println!("  FLOWVOICE_TIMEOUT_S Groq timeout, seconds (default 180)");
     println!("  FLOWVOICE_PASTE_DELAY_MS pause before Ctrl+V (default 0)");
+    println!("  FLOWVOICE_PASTE_METHOD clipboard|unicode keystrokes (default clipboard)");
     println!("  FLOWVOICE_RESTORE_MS clipboard restore delay (default 400, 0 keeps ours)");
     println!("  FLOWVOICE_LEADING_SPACE=1 space before alphanumeric replicas");
     println!("  FLOWPUNCT_MODEL    dir with rupunct_small_int8.onnx + tokenizer.json (default models/punct)");

@@ -653,11 +653,24 @@ fn is_decimal_dot(chars: &[char], i: usize) -> bool {
     i > 0 && i + 1 < chars.len() && chars[i - 1].is_ascii_digit() && chars[i + 1].is_ascii_digit()
 }
 
+/// Formatting switches beyond the language.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FormatOpts {
+    /// Rewrite digit runs as Russian words (`12` -> `двенадцать`, F-10).
+    /// Off by default: recognizers emit digits and users expect digits.
+    pub numbers_words: bool,
+}
+
 /// Format a raw dictation string into final, publish-ready text.
 ///
 /// Runs the full pipeline: cleanup -> filler removal -> dedup ->
 /// sentence classification -> punctuation -> capitalization.
 pub fn format(raw: &str, lang: Language) -> String {
+    format_with(raw, lang, FormatOpts::default())
+}
+
+/// [`format`] with explicit switches.
+pub fn format_with(raw: &str, lang: Language, opts: FormatOpts) -> String {
     let raw = raw.trim();
     if raw.is_empty() {
         return String::new();
@@ -718,8 +731,14 @@ pub fn format(raw: &str, lang: Language) -> String {
         text.push_str(term);
     }
     // The recognizer may glue or double marks ("12% ,", "готово.,");
-    // collapse runs, then case every sentence start.
+    // collapse runs, normalize dates/times, optionally spell out numbers,
+    // then case every sentence start.
     text = collapse_punctuation(&text);
+    text = normalize_dates(&text);
+    text = normalize_times(&text);
+    if opts.numbers_words {
+        text = digits_to_words(&text, true);
+    }
     capitalize_sentences(&mut text);
     text
 }
@@ -762,6 +781,346 @@ pub fn clean(raw: &str, lang: Language) -> String {
 /// punctuator in favor of deterministic rules (J-09).
 pub fn word_count(text: &str) -> usize {
     text.split_whitespace().count()
+}
+
+/// Minimum-length gate for finalized replicas ("порог короткой реплики"):
+/// stray one-char marks never become pastes. Counts Unicode chars.
+pub fn meets_min_len(text: &str, min_chars: usize) -> bool {
+    text.chars().count() >= min_chars
+}
+
+/// Spell an integer in Russian words (F-10 `FLOWVOICE_NUMBERS=words`).
+/// Covers 0..=999_999_999; out-of-range input passes through unchanged.
+pub fn num_to_ru_words(n: i64) -> Option<String> {
+    if !(0..=999_999_999).contains(&n) {
+        return None;
+    }
+    const HUNDREDS: &[&str] = &[
+        "",
+        "сто",
+        "двести",
+        "триста",
+        "четыреста",
+        "пятьсот",
+        "шестьсот",
+        "семьсот",
+        "восемьсот",
+        "девятьсот",
+    ];
+    const TENS: &[&str] = &[
+        "",
+        "",
+        "двадцать",
+        "тридцать",
+        "сорок",
+        "пятьдесят",
+        "шестьдесят",
+        "семьдесят",
+        "восемьдесят",
+        "девяносто",
+    ];
+    const TEENS: &[&str] = &[
+        "десять",
+        "одиннадцать",
+        "двенадцать",
+        "тринадцать",
+        "четырнадцать",
+        "пятнадцать",
+        "шестнадцать",
+        "семнадцать",
+        "восемнадцать",
+        "девятнадцать",
+    ];
+    const ONES_M: &[&str] = &[
+        "",
+        "один",
+        "два",
+        "три",
+        "четыре",
+        "пять",
+        "шесть",
+        "семь",
+        "восемь",
+        "девять",
+    ];
+    const ONES_F: &[&str] = &[
+        "",
+        "одна",
+        "две",
+        "три",
+        "четыре",
+        "пять",
+        "шесть",
+        "семь",
+        "восемь",
+        "девять",
+    ];
+    fn group(v: i64, ones: &[&str], out: &mut Vec<String>) {
+        let h = (v / 100) as usize;
+        let t = ((v % 100) / 10) as usize;
+        let o = (v % 10) as usize;
+        if h > 0 {
+            out.push(HUNDREDS[h].to_string());
+        }
+        if t == 1 {
+            out.push(TEENS[o].to_string());
+        } else {
+            if t > 1 {
+                out.push(TENS[t].to_string());
+            }
+            if o > 0 {
+                out.push(ones[o].to_string());
+            }
+        }
+    }
+    fn plural(n: i64, one: &'static str, few: &'static str, many: &'static str) -> &'static str {
+        let n10 = n % 10;
+        let n100 = n % 100;
+        if n10 == 1 && n100 != 11 {
+            one
+        } else if (2..=4).contains(&n10) && !(12..=14).contains(&n100) {
+            few
+        } else {
+            many
+        }
+    }
+    if n == 0 {
+        return Some("ноль".to_string());
+    }
+    let mut out: Vec<String> = Vec::new();
+    let millions = n / 1_000_000;
+    if millions > 0 {
+        group(millions, ONES_M, &mut out);
+        out.push(plural(millions, "миллион", "миллиона", "миллионов").to_string());
+    }
+    let thousands = (n % 1_000_000) / 1000;
+    if thousands > 0 {
+        group(thousands, ONES_F, &mut out);
+        out.push(plural(thousands, "тысяча", "тысячи", "тысяч").to_string());
+    }
+    group(n % 1000, ONES_M, &mut out);
+    Some(out.join(" "))
+}
+
+/// Rewrite digit runs as Russian words when `words` mode is on (F-10).
+/// Runs attached to letters (`COVID-19`, `gpt-4`) are left alone.
+pub fn digits_to_words(text: &str, words_mode: bool) -> String {
+    if !words_mode {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if !chars[i].is_ascii_digit() {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < chars.len() && chars[j].is_ascii_digit() {
+            j += 1;
+        }
+        let run: String = chars[i..j].iter().collect();
+        // Attached to letters (COVID-19) or separators of dates/times
+        // (12.03, 15:30, 12/03): leave alone.
+        let attached = (i > 0
+            && (chars[i - 1].is_alphanumeric() || matches!(chars[i - 1], '.' | '/' | '-' | ':')))
+            || (j < chars.len()
+                && (chars[j].is_alphanumeric() || matches!(chars[j], '.' | '/' | '-' | ':')));
+        if attached {
+            out.push_str(&run);
+        } else if let Ok(n) = run.parse::<i64>() {
+            match num_to_ru_words(n) {
+                Some(w) => out.push_str(&w),
+                None => out.push_str(&run),
+            }
+        } else {
+            out.push_str(&run);
+        }
+        i = j;
+    }
+    out
+}
+
+/// Normalize dates to `DD.MM[.YYYY]` (F-11): `12.03`, `12/03/2024`,
+/// `12 марта`, `12 марта 2024` (genitive month names).
+pub fn normalize_dates(text: &str) -> String {
+    const MONTHS: &[(&str, &str)] = &[
+        ("января", "01"),
+        ("февраля", "02"),
+        ("марта", "03"),
+        ("апреля", "04"),
+        ("мая", "05"),
+        ("июня", "06"),
+        ("июля", "07"),
+        ("августа", "08"),
+        ("сентября", "09"),
+        ("октября", "10"),
+        ("ноября", "11"),
+        ("декабря", "12"),
+    ];
+    let mut out = text.to_string();
+    for (name, num) in MONTHS {
+        // `12 марта [2024]` -> `12.03[.2024]`, word-boundary aware.
+        let mut res = String::with_capacity(out.len());
+        let chars: Vec<char> = out.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i].is_ascii_digit() {
+                let mut j = i;
+                while j < chars.len() && chars[j].is_ascii_digit() {
+                    j += 1;
+                }
+                let day: String = chars[i..j].iter().collect();
+                let mut k = j;
+                while k < chars.len() && (chars[k] == ' ' || chars[k] == '\u{a0}') {
+                    k += 1;
+                }
+                let name_chars: Vec<char> = name.chars().collect();
+                let matches_month = day.len() <= 2
+                    && day
+                        .parse::<u32>()
+                        .map(|d| (1..=31).contains(&d))
+                        .unwrap_or(false)
+                    && chars[k..].starts_with(&name_chars);
+                if matches_month {
+                    let after = k + name_chars.len();
+                    let after_ok = chars.get(after).map(|c| !c.is_alphabetic()).unwrap_or(true);
+                    if after_ok {
+                        res.push_str(&format!("{:0>2}.{num}", day.parse::<u32>().unwrap()));
+                        // Optional year right after: `12 марта 2024`.
+                        let mut y = after;
+                        while y < chars.len() && chars[y].is_whitespace() {
+                            y += 1;
+                        }
+                        let mut z = y;
+                        while z < chars.len() && chars[z].is_ascii_digit() {
+                            z += 1;
+                        }
+                        if z - y == 4 {
+                            res.push('.');
+                            res.push_str(&chars[y..z].iter().collect::<String>());
+                            i = z;
+                        } else {
+                            i = after;
+                        }
+                        continue;
+                    }
+                }
+                res.push_str(&day);
+                i = j;
+                continue;
+            }
+            res.push(chars[i]);
+            i += 1;
+        }
+        out = res;
+    }
+    // Numeric `D/M[/Y]` with slashes or dashes -> dots: `12/03` -> `12.03`.
+    let mut res = String::with_capacity(out.len());
+    let chars: Vec<char> = out.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].is_ascii_digit() {
+            let mut j = i;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j < chars.len()
+                && (chars[j] == '/' || chars[j] == '-')
+                && j + 1 < chars.len()
+                && chars[j + 1].is_ascii_digit()
+            {
+                let mut k = j + 1;
+                while k < chars.len() && chars[k].is_ascii_digit() {
+                    k += 1;
+                }
+                let (a, b) = (
+                    &chars[i..j].iter().collect::<String>(),
+                    &chars[j + 1..k].iter().collect::<String>(),
+                );
+                if a.len() <= 2 && b.len() == 2 {
+                    res.push_str(&format!("{a:0>2}.{b}"));
+                    i = k;
+                    continue;
+                }
+            }
+            res.push_str(&chars[i..j].iter().collect::<String>());
+            i = j;
+            continue;
+        }
+        res.push(chars[i]);
+        i += 1;
+    }
+    res
+}
+
+/// Trailing sentence marks carried by a consumed word (`часа.` -> `.`).
+fn trailing_marks(word: &str) -> String {
+    word.chars()
+        .rev()
+        .take_while(|c| matches!(c, '.' | ',' | '?' | '!'))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+/// Normalize spoken times to `H:MM` (F-12): `15:30` stays, `в 3 часа`,
+/// `5 часов 20 минут`, `в 7 вечера` (evening +12h, best-effort).
+pub fn normalize_times(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let words: Vec<&str> = text.split(' ').collect();
+    let mut i = 0;
+    while i < words.len() {
+        if let Ok(h) = words[i].parse::<u32>() {
+            if h <= 23 && i + 1 < words.len() {
+                let next = words[i + 1].to_lowercase();
+                // Bare evening marker: `в 7 вечера` -> `19:00`.
+                if ["вечера", "вечером", "ночи", "ночью"].contains(&next.as_str()) && h < 12
+                {
+                    out.push_str(&format!("{}:00{} ", h + 12, trailing_marks(words[i + 1])));
+                    i += 2;
+                    continue;
+                }
+                let is_hour = next.starts_with("час");
+                if is_hour {
+                    let mut mm = "00".to_string();
+                    let mut skip = 2;
+                    if i + 2 < words.len() {
+                        if let Ok(m) = words[i + 2].parse::<u32>() {
+                            if m <= 59
+                                && i + 3 < words.len()
+                                && words[i + 3].to_lowercase().starts_with("минут")
+                            {
+                                mm = format!("{m:02}");
+                                skip = 4;
+                            }
+                        }
+                    }
+                    // Evening marker after the hour word(s).
+                    let mut hh = h;
+                    if i + skip < words.len()
+                        && ["вечера", "вечером", "ночи", "ночью"]
+                            .contains(&words[i + skip].to_lowercase().as_str())
+                        && hh < 12
+                    {
+                        hh += 12;
+                        skip += 1;
+                    }
+                    let tail = trailing_marks(words[i + skip - 1]);
+                    out.push_str(&format!("{hh}:{mm}{tail} "));
+                    i += skip;
+                    continue;
+                }
+            }
+        }
+        out.push_str(words[i]);
+        out.push(' ');
+        i += 1;
+    }
+    out.trim_end().to_string()
 }
 
 /// Post-processing profile (J-01/J-02/J-04/J-05): how much the pipeline may

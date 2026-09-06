@@ -24,6 +24,17 @@ pub struct Settings {
     pub backend: BackendPref,
     pub profile: String,
     pub sound: bool,
+    /// Second hotkey for edit mode (`выкл` disables, D-14).
+    pub edit_key: String,
+    /// Start with Windows via HKCU Run (B-10).
+    pub autostart: bool,
+    /// Paste engine: `clipboard` (Ctrl+V) or `unicode` keystrokes (L-03).
+    pub paste_method: String,
+    /// Encrypt history.json with DPAPI (M-17).
+    pub history_encrypt: bool,
+    /// Simple noise gate on capture (C-16).
+    #[cfg(feature = "audio")]
+    pub noise_gate: bool,
 }
 
 #[cfg(feature = "gui")]
@@ -36,6 +47,12 @@ impl Default for Settings {
             backend: BackendPref::Auto,
             profile: "auto".to_string(),
             sound: true,
+            edit_key: "выкл".to_string(),
+            autostart: false,
+            paste_method: "clipboard".to_string(),
+            history_encrypt: false,
+            #[cfg(feature = "audio")]
+            noise_gate: false,
         }
     }
 }
@@ -246,7 +263,8 @@ fn ensure_private(path: &std::path::Path) {
 
 /// Crash-recovery marker (O-09): written at capture start, removed after
 /// paste. A leftover at startup means the previous run died mid-replica.
-#[cfg(any(feature = "audio", feature = "gui"))]
+/// Absent in tests: no FS writes from unit tests.
+#[cfg(all(any(feature = "audio", feature = "gui"), not(test)))]
 pub(crate) fn write_pending() {
     let path = app_dir().join("pending.json");
     if let Some(parent) = path.parent() {

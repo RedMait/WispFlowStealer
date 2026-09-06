@@ -124,9 +124,12 @@ fn finalize(text: String) -> String {
     let explicit = std::env::var("FLOWVOICE_LANG").ok();
     let lang = Language::resolve(explicit.as_deref(), &text);
     let profile = resolve_profile();
+    let opts = flowcore::FormatOpts {
+        numbers_words: numbers_words(),
+    };
     // Chat replicas stay short and heuristic; Code keeps identifiers.
     if profile == flowcore::Profile::Chat {
-        return flowcore::format(&text, lang);
+        return flowcore::format_with(&text, lang, opts);
     }
     if profile == flowcore::Profile::Code {
         return flowcore::format_code(&text);
@@ -137,22 +140,30 @@ fn finalize(text: String) -> String {
             // Short texts go through deterministic rules instead of the
             // neural model (J-09): less latency, fewer surprises.
             if flowcore::word_count(&cleaned) <= 10 {
-                return flowcore::format(&text, lang);
+                return flowcore::format_with(&text, lang, opts);
             }
             return punct
                 .punct(&cleaned)
-                .unwrap_or_else(|_| flowcore::format(&text, lang));
+                .unwrap_or_else(|_| flowcore::format_with(&text, lang, opts));
         }
     }
-    flowcore::format(&text, lang)
+    flowcore::format_with(&text, lang, opts)
+}
+
+/// One-shaped error context lives in [`crate::util::xerr`].
+use crate::util::xerr;
+
+/// `FLOWVOICE_NUMBERS=words` spells digit runs in Russian (F-10).
+fn numbers_words() -> bool {
+    std::env::var("FLOWVOICE_NUMBERS")
+        .map(|v| v.eq_ignore_ascii_case("words"))
+        .unwrap_or(false)
 }
 
 /// Raw mode (`FLOWVOICE_RAW=1`): skip all post-processing, return the bare
 /// transcript. Also the off switch for post-processing (J-06).
 fn is_raw() -> bool {
-    std::env::var("FLOWVOICE_RAW")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    crate::util::env_flag("FLOWVOICE_RAW")
 }
 
 /// Capture until the hotkey is released, recognize, return final text.
@@ -166,9 +177,63 @@ fn is_raw() -> bool {
 /// cleanup + heuristic commas ([`flowcore::format`]); Vosk outputs bare
 /// words and goes through the full [`finalize`] pipeline (neural
 /// punctuation for RU when present).
+/// VAD amplitude threshold (`FLOWVOICE_VAD_LEVEL`, default 200): samples
+/// quieter than this count as silence for trimming (E-01/E-02/E-04).
+fn vad_level() -> i16 {
+    std::env::var("FLOWVOICE_VAD_LEVEL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200)
+}
+
+/// Strip leading/trailing silence (E-01/E-02). All-silent input is kept
+/// as-is: the engines report it better than an empty buffer does.
+fn trim_silence(pcm: &[i16]) -> Vec<i16> {
+    let level = vad_level().abs() as i32;
+    let mut start = 0;
+    while start < pcm.len() && (pcm[start] as i32).abs() < level {
+        start += 1;
+    }
+    let mut end = pcm.len();
+    while end > start && (pcm[end - 1] as i32).abs() < level {
+        end -= 1;
+    }
+    if start >= end {
+        return pcm.to_vec();
+    }
+    pcm[start..end].to_vec()
+}
+
+/// Optional noise gate (`FLOWVOICE_NOISE_GATE=1`): zero sub-threshold
+/// samples before recognition (C-16). Off by default.
+fn noise_gate(pcm: &mut [i16]) {
+    let on = std::env::var("FLOWVOICE_NOISE_GATE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !on {
+        return;
+    }
+    let level = vad_level().abs() as i32;
+    for s in pcm.iter_mut() {
+        if (*s as i32).abs() < level {
+            *s = 0;
+        }
+    }
+}
+
 pub fn transcribe() -> Result<String, String> {
     let (pcm, rate) = capture_until_stop()?;
-    let pcm16k = resample_to_16k(&pcm, rate);
+    // Accidental taps (<200 ms hold) never reach STT: no empty replicas,
+    // no wasted API calls (D-10).
+    let min_hold_ms = crate::util::env_u64("FLOWVOICE_MIN_HOLD_MS", 200);
+    if let Some(t0) = crate::win::press_instant() {
+        if !crate::hotkey::meets_min_hold(t0.elapsed().as_millis() as u64, min_hold_ms) {
+            return Ok(String::new());
+        }
+    }
+    let mut pcm16k = resample_to_16k(&pcm, rate);
+    noise_gate(&mut pcm16k);
+    let pcm16k = trim_silence(&pcm16k);
     let pref = pref();
 
     // Pure priority table (unit-tested in `backend::select`).
@@ -257,6 +322,11 @@ fn apply_commands(text: String) -> String {
     if is_raw() || text.is_empty() {
         return text;
     }
+    // Voice macros first: an exact phrase presses keys instead of
+    // dictating anything (AJ-01/AJ-02/AJ-03).
+    if let Some(m) = run_macro(&text) {
+        return m;
+    }
     let Some(cmd) = crate::command::parse(&text) else {
         return text;
     };
@@ -344,10 +414,13 @@ fn format_segments(raw: Vec<String>) -> String {
             .join(" ");
     }
     let explicit = std::env::var("FLOWVOICE_LANG").ok();
+    let opts = flowcore::FormatOpts {
+        numbers_words: numbers_words(),
+    };
     raw.into_iter()
         .map(|seg| {
             let lang = flowcore::Language::resolve(explicit.as_deref(), &seg);
-            flowcore::format(&seg, lang)
+            flowcore::format_with(&seg, lang, opts)
         })
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
@@ -372,6 +445,44 @@ fn last_replica_text() -> String {
     crate::state::get()
         .and_then(|s| s.last_text.lock().ok().map(|t| t.clone()))
         .unwrap_or_default()
+}
+
+/// Voice macros from `%APPDATA%/WispFlowStealer/macros.json`
+/// (`[{"phrase": "сохрани", "keys": "ctrl+s"}]`, AJ-02). Missing or broken
+/// file simply means no macros.
+fn load_macros() -> Vec<crate::macros::Macro> {
+    let path = crate::state::app_dir().join("macros.json");
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Vec::new();
+    };
+    value
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|m| {
+            Some(crate::macros::Macro {
+                phrase: m.get("phrase")?.as_str()?.to_string(),
+                keys: m.get("keys")?.as_str()?.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Exact-phrase macro execution: press the keys, paste nothing.
+fn run_macro(text: &str) -> Option<String> {
+    let macros = load_macros();
+    if macros.is_empty() {
+        return None;
+    }
+    let hit = crate::macros::find_match(&macros, text)?;
+    let strokes = crate::macros::parse_combo(&hit.keys)?;
+    crate::win::send_combo(&strokes);
+    crate::state::emit(&format!("[macro] {} -> {}", hit.phrase, hit.keys));
+    Some(String::new())
 }
 
 /// Stash pre-edit text for `отмени` (J-15).
@@ -401,6 +512,24 @@ fn transcript(result: &CompleteResult<'_>) -> String {
 /// Case-insensitive substring match for `--device`/`FLOWVOICE_DEVICE`.
 fn device_matches(name: &str, want: &str) -> bool {
     name.to_lowercase().contains(&want.to_lowercase())
+}
+
+/// Microphone failure, translated into a next step (X-10/X-11): access
+/// denials name the Windows privacy toggle instead of dumping drivers.
+fn mic_help(detail: &str) -> String {
+    let low = detail.to_lowercase();
+    if low.contains("denied")
+        || low.contains("permission")
+        || low.contains("access")
+        || low.contains("unavailable")
+        || low.contains("no default")
+        || low.contains("not found")
+    {
+        return format!(
+            "{detail}. Разрешите микрофон: Параметры Windows → Конфиденциальность → Микрофон → доступ для классических приложений, затем нажмите хоткей снова"
+        );
+    }
+    detail.to_string()
 }
 
 /// Transcribe one audio file without a microphone (N-01..N-05, Y-01).
@@ -436,7 +565,9 @@ pub fn transcribe_file(path: &str, opts: &crate::FileOpts) -> Result<String, Str
                 ));
             }
             let (pcm, rate) = crate::whisper::decode_wav(&bytes)?;
-            let pcm16k = resample_to_16k(&pcm, rate);
+            let mut pcm16k = resample_to_16k(&pcm, rate);
+            noise_gate(&mut pcm16k);
+            let pcm16k = trim_silence(&pcm16k);
             match engine {
                 crate::backend::Backend::Local => crate::whisper::transcribe_pcm(&pcm16k)?
                     .into_iter()
@@ -458,34 +589,72 @@ pub fn transcribe_file(path: &str, opts: &crate::FileOpts) -> Result<String, Str
             }
         }
     };
-    let out = render_spans(&spans, opts);
+    // Total duration for timestamp fallback (local WAV only).
+    let total_secs = if is_wav_name(&fname) {
+        crate::whisper::decode_wav(&bytes)
+            .ok()
+            .map(|(pcm, rate)| pcm.len() as f32 / rate.max(1) as f32)
+    } else {
+        None
+    };
+    let out = render_spans(&spans, opts, total_secs);
     if opts.save && path != "-" {
         let txt = std::path::Path::new(path).with_extension("txt");
-        std::fs::write(&txt, &out).map_err(|e| format!("cannot write {}: {e}", txt.display()))?;
+        xerr(
+            std::fs::write(&txt, &out),
+            &format!("cannot write {}", txt.display()),
+        )?;
     }
     Ok(out)
 }
 
-/// Render segments: per-sentence formatting, optional `[mm:ss]` prefixes
-/// (N-13), joined with spaces.
-fn render_spans(spans: &[crate::whisper::Span], opts: &crate::FileOpts) -> String {
+/// Batch-transcribe a directory of audio files (N-09, Y-09).
+/// (N-13), joined with spaces. When the engine gives no times but the total
+/// duration is known (local WAV), times are split proportionally by length.
+fn render_spans(
+    spans: &[crate::whisper::Span],
+    opts: &crate::FileOpts,
+    total_secs: Option<f32>,
+) -> String {
     let explicit = std::env::var("FLOWVOICE_LANG").ok();
     let mut parts = Vec::with_capacity(spans.len());
+    let need_times = opts.timestamps
+        && spans.iter().all(|s| s.end <= s.start)
+        && total_secs.unwrap_or(0.0) > 0.0;
+    let total_chars: usize = spans.iter().map(|s| s.text.chars().count().max(1)).sum();
+    let mut cursor = 0.0f32;
     for span in spans {
         let formatted = if is_raw() {
             span.text.clone()
         } else {
             let lang = flowcore::Language::resolve(explicit.as_deref(), &span.text);
-            flowcore::format(&span.text, lang)
+            flowcore::format_with(
+                &span.text,
+                lang,
+                flowcore::FormatOpts {
+                    numbers_words: numbers_words(),
+                },
+            )
         };
         if formatted.trim().is_empty() {
             continue;
         }
-        if opts.timestamps && span.end > span.start {
+        let (start, end) = if span.end > span.start {
+            (span.start, span.end)
+        } else if need_times {
+            let share = total_secs.unwrap_or(0.0) * span.text.chars().count().max(1) as f32
+                / total_chars.max(1) as f32;
+            let s = cursor;
+            cursor += share;
+            (s, cursor)
+        } else {
+            (0.0, 0.0)
+        };
+        if opts.timestamps && end > start {
             parts.push(format!(
                 "[{:02}:{:04.1}] {formatted}",
-                (span.start / 60.0) as u32,
-                span.start % 60.0
+                (start / 60.0) as u32,
+                start % 60.0
             ));
         } else {
             parts.push(formatted);
@@ -500,16 +669,16 @@ fn render_spans(spans: &[crate::whisper::Span], opts: &crate::FileOpts) -> Strin
 /// the batch: it is reported and skipped.
 pub fn transcribe_dir(dir: &str, opts: &crate::FileOpts) -> Result<usize, String> {
     const EXTS: &[&str] = &["wav", "mp3", "m4a", "ogg", "flac", "webm"];
-    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
-        .map_err(|e| format!("cannot list {dir}: {e}"))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            p.extension()
-                .and_then(|x| x.to_str())
-                .map(|x| EXTS.contains(&x.to_ascii_lowercase().as_str()))
-                .unwrap_or(false)
-        })
-        .collect();
+    let mut files: Vec<std::path::PathBuf> =
+        xerr(std::fs::read_dir(dir), &format!("cannot list {dir}"))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.extension()
+                    .and_then(|x| x.to_str())
+                    .map(|x| EXTS.contains(&x.to_ascii_lowercase().as_str()))
+                    .unwrap_or(false)
+            })
+            .collect();
     files.sort();
     if files.is_empty() {
         return Err(format!("no audio files in {dir}"));
@@ -532,21 +701,17 @@ fn read_audio_input(path: &str) -> Result<(Vec<u8>, String), String> {
     if path == "-" {
         use std::io::Read as _;
         let mut buf = Vec::new();
-        std::io::stdin()
-            .read_to_end(&mut buf)
-            .map_err(|e| format!("stdin: {e}"))?;
+        xerr(std::io::stdin().read_to_end(&mut buf), "stdin")?;
         return Ok((buf, "stdin.wav".to_string()));
     }
-    std::fs::read(path)
-        .map(|b| {
-            let name = std::path::Path::new(path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("input.wav")
-                .to_string();
-            (b, name)
-        })
-        .map_err(|e| format!("cannot read {path}: {e} (N-14)"))
+    xerr(std::fs::read(path), &format!("cannot read {path} (N-14)")).map(|b| {
+        let name = std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("input.wav")
+            .to_string();
+        (b, name)
+    })
 }
 
 fn stage_temp(bytes: &[u8], fname: &str) -> Result<std::path::PathBuf, String> {
@@ -563,7 +728,7 @@ fn stage_temp(bytes: &[u8], fname: &str) -> Result<std::path::PathBuf, String> {
         })
         .collect();
     let path = std::env::temp_dir().join(format!("flowvoice-file-{n}-{safe}"));
-    std::fs::write(&path, bytes).map_err(|e| format!("cannot stage file: {e}"))?;
+    xerr(std::fs::write(&path, bytes), "cannot stage file")?;
     Ok(path)
 }
 
@@ -579,19 +744,15 @@ fn capture_until_stop() -> Result<(Vec<i16>, u32), String> {
     let host = cpal::default_host();
     let wanted = std::env::var("FLOWVOICE_DEVICE").ok();
     let device = match wanted {
-        Some(want) => host
-            .input_devices()
-            .map_err(|e| format!("cannot list input devices: {e}"))?
+        Some(want) => xerr(host.input_devices(), "cannot list input devices")?
             .find(|d| d.name().map(|n| device_matches(&n, &want)).unwrap_or(false))
             .ok_or_else(|| format!("no input device matching `{want}`"))?,
-        None => host
-            .default_input_device()
-            .ok_or_else(|| "no default audio input device".to_string())?,
+        None => host.default_input_device().ok_or_else(|| {
+            mic_help("no default audio input device: the OS gave us no microphone")
+        })?,
     };
 
-    let supported = device
-        .default_input_config()
-        .map_err(|e| format!("cannot query input config: {e}"))?;
+    let supported = xerr(device.default_input_config(), "cannot query input config")?;
 
     let channels = supported.channels() as usize;
     let rate = supported.sample_rate().0;
@@ -605,6 +766,11 @@ fn capture_until_stop() -> Result<(Vec<i16>, u32), String> {
     let storage: std::sync::Arc<std::sync::Mutex<Vec<i16>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
+    // Fresh meter + peak per utterance.
+    use std::sync::atomic::Ordering;
+    MIC_LEVEL.store(0, Ordering::SeqCst);
+    MIC_PEAK.store(0, Ordering::SeqCst);
+
     let sink = storage.clone();
     let err_fn = |e| eprintln!("[audio] stream error: {e}");
 
@@ -615,24 +781,37 @@ fn capture_until_stop() -> Result<(Vec<i16>, u32), String> {
         channels,
         sink,
         err_fn,
-    )?;
+    )
+    .map_err(|e| mic_help(&e.to_string()))?;
 
     stream
         .play()
-        .map_err(|e| format!("cannot start audio stream: {e}"))?;
+        .map_err(|e| mic_help(&format!("cannot start audio stream: {e}")))?;
 
     // Wait for the hotkey to be released.
     while !crate::win::is_stop_requested() {
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
 
-    stream
-        .pause()
-        .map_err(|e| format!("cannot pause audio stream: {e}"))?;
+    xerr(stream.pause(), "cannot pause audio stream")?;
 
     let data = storage
         .lock()
         .map_err(|_| "audio buffer poisoned".to_string())?;
+    // The stream object dies here: mic released right after the replica
+    // (AG-01/AG-03) and the meter visibly falls to zero.
+    drop(stream);
+    MIC_LEVEL.store(0, Ordering::SeqCst);
+    // Zero-signal warning (C-08): capture ran but the mic stayed silent.
+    if MIC_PEAK.load(Ordering::SeqCst) < vad_level().max(0) as u32 {
+        crate::state::emit("[warn] нулевой уровень сигнала — проверьте микрофон");
+    }
+    // Clipping warning (AI-01): hot overloaded input instead of silence.
+    let total = data.len().max(1) as f32;
+    let clipped = data.iter().filter(|s| (**s as i32).abs() >= 32760).count() as f32;
+    if clipped / total > 0.05 {
+        crate::state::emit("[warn] вход перегружен (клиппинг) — убавьте усиление микрофона");
+    }
     Ok((data.clone(), rate))
 }
 
@@ -688,22 +867,39 @@ fn build_stream(
 }
 
 /// Downmix interleaved frames into a single mono i16 stream in the callback.
+/// Also feeds the live level meter + session peak (C-07/C-08).
 fn push_mono(sink: &std::sync::Arc<std::sync::Mutex<Vec<i16>>>, data: &[i16], channels: usize) {
+    use std::sync::atomic::Ordering;
     let mut buf = match sink.lock() {
         Ok(buf) => buf,
         Err(_) => return,
     };
+    let mut peak = 0i32;
     for frame in data.chunks(channels) {
         let sum: i32 = frame.iter().map(|s| i32::from(*s)).sum();
         let mono = (sum / frame.len() as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        let a = (mono as i32).abs();
+        if a > peak {
+            peak = a;
+        }
         buf.push(mono);
     }
+    MIC_LEVEL.store(
+        ((peak * 100) / 32768).clamp(0, 100) as u32,
+        Ordering::SeqCst,
+    );
+    MIC_PEAK.fetch_max(peak as u32, Ordering::SeqCst);
 }
 
 /// Convert an f32 sample in [-1, 1] to i16.
 fn f32_to_i16(sample: f32) -> i16 {
     (sample * 32767.0).clamp(-32768.0, 32767.0) as i16
 }
+
+/// Live input level 0..100 for the GUI meter (C-07), updated per callback.
+pub static MIC_LEVEL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Session peak amplitude (for the zero-signal warning, C-08).
+static MIC_PEAK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Simple linear resampler: input mono PCM at `rate` Hz -> 16 kHz.
 fn resample_to_16k(input: &[i16], rate: u32) -> Vec<i16> {
@@ -770,9 +966,37 @@ mod tests {
             timestamps: true,
             json: false,
         };
-        let out = render_spans(&spans, &opts);
+        let out = render_spans(&spans, &opts, None);
         assert!(out.starts_with("[01:01.5] Привет."), "{out}");
         assert!(out.contains("Мир."), "{out}");
+    }
+
+    #[test]
+    fn render_splits_times_proportionally() {
+        let spans = vec![
+            crate::whisper::Span {
+                text: "раз два".to_string(),
+                start: 0.0,
+                end: 0.0,
+            },
+            crate::whisper::Span {
+                text: "три".to_string(),
+                start: 0.0,
+                end: 0.0,
+            },
+        ];
+        let opts = crate::FileOpts {
+            save: false,
+            timestamps: true,
+            json: false,
+        };
+        // 7 + 3 chars over 10 s: first span owns [00:00, 00:07).
+        let out = render_spans(&spans, &opts, Some(10.0));
+        assert!(out.starts_with("[00:00.0]"), "{out}");
+        assert!(out.contains("[00:07.0]"), "{out}");
+        // No duration known: no prefixes at all.
+        let plain = render_spans(&spans, &opts, None);
+        assert!(!plain.contains('['), "{plain}");
     }
 
     #[test]
@@ -782,5 +1006,27 @@ mod tests {
         assert_eq!(resample_to_16k(&src, 16_000), src);
         let up = resample_to_16k(&[0i16, 1000], 8000);
         assert_eq!(up.len(), 4);
+    }
+
+    #[test]
+    fn silence_trim_keeps_speech_edges() {
+        // Threshold default is 200; speech at +-1000 stays.
+        let pcm = vec![0i16, 10, 50, 1000, -1500, 2000, 30, 5, 0];
+        assert_eq!(trim_silence(&pcm), vec![1000, -1500, 2000]);
+        // All-silent input is preserved (engines report it themselves).
+        let hush = vec![0i16, 5, 10];
+        assert_eq!(trim_silence(&hush), hush);
+        assert_eq!(trim_silence(&[]), Vec::<i16>::new());
+    }
+
+    #[test]
+    fn push_mono_downmix_preserves_every_frame() {
+        use std::sync::{Arc, Mutex};
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        // Stereo pairs average to mono (E-10: no samples lost).
+        push_mono(&sink, &[1000, 3000, -2000, -4000], 2);
+        assert_eq!(*sink.lock().unwrap(), vec![2000, -3000]);
+        push_mono(&sink, &[500], 1);
+        assert_eq!(*sink.lock().unwrap(), vec![2000, -3000, 500]);
     }
 }

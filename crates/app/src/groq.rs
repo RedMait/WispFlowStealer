@@ -126,10 +126,7 @@ fn post_audio(path: &std::path::Path, key: &str, mime: &str) -> Result<serde_jso
     } else {
         format!("file=@{};type={mime}", path.display())
     };
-    let timeout_s: u64 = std::env::var("FLOWVOICE_TIMEOUT_S")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(180);
+    let timeout_s = crate::util::env_u64("FLOWVOICE_TIMEOUT_S", 180);
     let mut cmd = Command::new("curl.exe");
     // Console child of a windowless parent would flash a terminal and
     // steal focus (breaking the Ctrl+V paste that follows).
@@ -166,9 +163,7 @@ fn post_audio(path: &std::path::Path, key: &str, mime: &str) -> Result<serde_jso
         }
         cmd.arg("-F").arg(format!("prompt={}", prompt()));
     }
-    let out = cmd
-        .output()
-        .map_err(|e| format!("cannot run curl.exe: {e}"))?;
+    let out = crate::util::xerr(cmd.output(), "cannot run curl.exe")?;
 
     if !out.status.success() {
         let tail = String::from_utf8_lossy(&out.stderr);
@@ -212,32 +207,30 @@ pub fn chat(system: &str, user: &str) -> Result<String, String> {
         .map_err(|e| format!("cannot stage chat body: {e}"))?;
     // The JSON rides in a file (not argv): Cyrillic survives any console
     // encoding, and the key never appears in process listings beyond -H.
-    let timeout_s: u64 = std::env::var("FLOWVOICE_TIMEOUT_S")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(180);
+    let timeout_s = crate::util::env_u64("FLOWVOICE_TIMEOUT_S", 180);
     let mut cmd = Command::new("curl.exe");
     {
         use std::os::windows::process::CommandExt as _;
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
-    let out = cmd
-        .arg("-sS")
-        .arg("--max-time")
-        .arg(timeout_s.min(900).to_string())
-        .arg("--retry")
-        .arg("2")
-        .arg("-X")
-        .arg("POST")
-        .arg("https://api.groq.com/openai/v1/chat/completions")
-        .arg("-H")
-        .arg(format!("Authorization: Bearer {key}"))
-        .arg("-H")
-        .arg("Content-Type: application/json")
-        .arg("--data-binary")
-        .arg(format!("@{}", path.display()))
-        .output()
-        .map_err(|e| format!("cannot run curl.exe: {e}"));
+    let out = crate::util::xerr(
+        cmd.arg("-sS")
+            .arg("--max-time")
+            .arg(timeout_s.min(900).to_string())
+            .arg("--retry")
+            .arg("2")
+            .arg("-X")
+            .arg("POST")
+            .arg("https://api.groq.com/openai/v1/chat/completions")
+            .arg("-H")
+            .arg(format!("Authorization: Bearer {key}"))
+            .arg("-H")
+            .arg("Content-Type: application/json")
+            .arg("--data-binary")
+            .arg(format!("@{}", path.display()))
+            .output(),
+        "cannot run curl.exe",
+    );
     let _ = std::fs::remove_file(&path);
     let out = out?;
     if !out.status.success() {

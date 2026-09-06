@@ -15,6 +15,11 @@ if (Test-Path -LiteralPath $desk) {
     Remove-Item -LiteralPath $desk -Force
     $removed += "shortcut: Desktop\flowvoice.lnk"
 }
+$runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+if ((Get-ItemProperty -LiteralPath $runKey -Name "flowvoice" -ErrorAction SilentlyContinue) -ne $null) {
+    Remove-ItemProperty -LiteralPath $runKey -Name "flowvoice" -Force
+    $removed += "autostart: HKCU Run value"
+}
 $repoLnk = Join-Path (Get-Location) "flowvoice-GUI.lnk"
 if (Test-Path -LiteralPath $repoLnk) {
     Write-Host "note: repo-local flowvoice-GUI.lnk left in place (gitignored)"

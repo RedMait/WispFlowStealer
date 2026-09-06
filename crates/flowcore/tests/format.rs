@@ -237,12 +237,83 @@ fn language_resolve_prefers_explicit_choice() {
     assert_eq!(word_count(""), 0);
     assert_eq!(flowcore::transliterate_ru("Привет, мир!"), "Privet, mir!");
     assert_eq!(flowcore::transliterate_ru("Щука Ёж"), "Shchuka Ezh");
+    assert!(flowcore::meets_min_len("Я.", 2));
+    assert!(flowcore::meets_min_len("раз два три", 2));
+    assert!(!flowcore::meets_min_len(",", 2));
+    assert!(!flowcore::meets_min_len("", 2));
 }
 
 #[test]
 fn whitespace_and_double_spaces_are_normalized() {
     assert_eq!(ru("привет    мир"), "Привет мир.");
     assert_eq!(ru("  я   иду   домой  "), "Я иду домой.");
+}
+
+#[test]
+fn normalizers_unify_numbers_dates_times() {
+    use flowcore::FormatOpts;
+    let words = FormatOpts {
+        numbers_words: true,
+    };
+    let digits = FormatOpts::default();
+    // F-10: digits -> words only when asked; attached runs survive.
+    assert_eq!(
+        flowcore::digits_to_words("купи 12 стульев", true),
+        "купи двенадцать стульев"
+    );
+    assert_eq!(
+        flowcore::digits_to_words("купи 12 стульев", false),
+        "купи 12 стульев"
+    );
+    assert_eq!(
+        flowcore::digits_to_words("COVID-19 и gpt-4", true),
+        "COVID-19 и gpt-4"
+    );
+    assert_eq!(flowcore::digits_to_words("12.03", true), "12.03");
+    assert_eq!(flowcore::num_to_ru_words(0), Some("ноль".to_string()));
+    assert_eq!(flowcore::num_to_ru_words(1), Some("один".to_string()));
+    assert_eq!(flowcore::num_to_ru_words(2), Some("два".to_string()));
+    assert_eq!(
+        flowcore::num_to_ru_words(21),
+        Some("двадцать один".to_string())
+    );
+    assert_eq!(
+        flowcore::num_to_ru_words(112),
+        Some("сто двенадцать".to_string())
+    );
+    assert_eq!(
+        flowcore::num_to_ru_words(2000),
+        Some("две тысячи".to_string())
+    );
+    assert_eq!(
+        flowcore::num_to_ru_words(60000),
+        Some("шестьдесят тысяч".to_string())
+    );
+    // F-11: dates.
+    assert_eq!(
+        flowcore::normalize_dates("встреча 12 марта"),
+        "встреча 12.03"
+    );
+    assert_eq!(
+        flowcore::normalize_dates("встреча 12 марта 2024 года"),
+        "встреча 12.03.2024 года"
+    );
+    assert_eq!(flowcore::normalize_dates("до 12/03"), "до 12.03");
+    assert_eq!(flowcore::normalize_dates("уже 12.03"), "уже 12.03");
+    // F-12: times.
+    assert_eq!(flowcore::normalize_times("в 3 часа"), "в 3:00");
+    assert_eq!(flowcore::normalize_times("5 часов 20 минут"), "5:20");
+    assert_eq!(flowcore::normalize_times("в 7 вечера"), "в 19:00");
+    assert_eq!(flowcore::normalize_times("в 15:30"), "в 15:30");
+    // End to end through format_with.
+    assert_eq!(
+        flowcore::format_with("встреча 12 марта в 3 часа", flowcore::Language::Ru, words),
+        "Встреча 12.03 в 3:00."
+    );
+    assert_eq!(
+        flowcore::format_with("купи 12 стульев", flowcore::Language::Ru, digits),
+        "Купи 12 стульев."
+    );
 }
 
 #[test]

@@ -97,10 +97,20 @@ pub fn to_line(e: &Entry) -> String {
 }
 
 /// Append one entry to the journal file (creates parent dirs).
+/// Rotates past 5 MiB: the old file becomes `journal.old.jsonl` (O-19).
 pub fn append(path: &std::path::Path, e: &Entry) -> std::io::Result<()> {
+    append_with_limit(path, e, 5 * 1024 * 1024)
+}
+
+fn append_with_limit(path: &std::path::Path, e: &Entry, max_bytes: u64) -> std::io::Result<()> {
     use std::io::Write as _;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+    }
+    if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > max_bytes {
+        let old = path.with_extension("old.jsonl");
+        let _ = std::fs::remove_file(&old);
+        let _ = std::fs::rename(path, &old);
     }
     let mut f = std::fs::OpenOptions::new()
         .create(true)
@@ -390,6 +400,21 @@ mod tests {
         append(&path, &sample()).expect("append works");
         let back = read_all(&path);
         assert_eq!(back, vec![sample()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotation_kicks_in_over_limit() {
+        let dir = std::env::temp_dir().join(format!(
+            "flowvoice-jrot-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        let path = dir.join("journal.jsonl");
+        append_with_limit(&path, &sample(), 10).expect("first");
+        append_with_limit(&path, &sample(), 10).expect("second rotates");
+        assert!(dir.join("journal.old.jsonl").exists());
+        assert!(!read_all(&path).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

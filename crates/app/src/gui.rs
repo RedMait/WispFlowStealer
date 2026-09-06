@@ -64,6 +64,24 @@ fn load_settings() -> Settings {
         if let Some(sound) = v.get("sound").and_then(|x| x.as_bool()) {
             s.sound = sound;
         }
+        if let Some(k) = v.get("edit_key").and_then(|x| x.as_str()) {
+            s.edit_key = k.to_string();
+        }
+        if let Some(a) = v.get("autostart").and_then(|x| x.as_bool()) {
+            s.autostart = a;
+        }
+        if let Some(e) = v.get("history_encrypt").and_then(|x| x.as_bool()) {
+            s.history_encrypt = e;
+        }
+        if let Some(m) = v.get("paste_method").and_then(|x| x.as_str()) {
+            if matches!(m, "clipboard" | "unicode") {
+                s.paste_method = m.to_string();
+            }
+        }
+        #[cfg(feature = "audio")]
+        if let Some(gate) = v.get("noise_gate").and_then(|x| x.as_bool()) {
+            s.noise_gate = gate;
+        }
     }
     // Env wins over the file for the backend choice.
     if let Some(env_pref) = BackendPref::from_env() {
@@ -73,17 +91,56 @@ fn load_settings() -> Settings {
 }
 
 fn save_settings(s: &Settings) -> Result<(), String> {
-    write_json(
-        "config.json",
-        &serde_json::json!({
-            "hotkey": s.hotkey,
-            "lang": s.lang,
-            "groq_model": s.groq_model,
-            "backend": s.backend.label(),
-            "profile": s.profile,
-            "sound": s.sound,
-        }),
-    )
+    let mut map = serde_json::Map::new();
+    let put =
+        |map: &mut serde_json::Map<String, serde_json::Value>, k: &str, v: serde_json::Value| {
+            map.insert(k.to_string(), v);
+        };
+    put(
+        &mut map,
+        "hotkey",
+        serde_json::Value::String(s.hotkey.clone()),
+    );
+    put(&mut map, "lang", serde_json::Value::String(s.lang.clone()));
+    put(
+        &mut map,
+        "groq_model",
+        serde_json::Value::String(s.groq_model.clone()),
+    );
+    put(
+        &mut map,
+        "backend",
+        serde_json::Value::String(s.backend.label().to_string()),
+    );
+    put(
+        &mut map,
+        "profile",
+        serde_json::Value::String(s.profile.clone()),
+    );
+    put(&mut map, "sound", serde_json::Value::Bool(s.sound));
+    put(
+        &mut map,
+        "edit_key",
+        serde_json::Value::String(s.edit_key.clone()),
+    );
+    put(&mut map, "autostart", serde_json::Value::Bool(s.autostart));
+    put(
+        &mut map,
+        "history_encrypt",
+        serde_json::Value::Bool(s.history_encrypt),
+    );
+    put(
+        &mut map,
+        "paste_method",
+        serde_json::Value::String(s.paste_method.clone()),
+    );
+    #[cfg(feature = "audio")]
+    put(
+        &mut map,
+        "noise_gate",
+        serde_json::Value::Bool(s.noise_gate),
+    );
+    write_json("config.json", &serde_json::Value::Object(map))
 }
 
 /// History export (M-11): JSONL with UTC timestamps + app, next to settings.
@@ -113,7 +170,9 @@ fn fmt_time(when: std::time::SystemTime) -> String {
 }
 
 /// 32x32 tray icon: dark rounded square, white mic capsule, status dot.
-fn tray_icon(recording: bool) -> tray_icon::Icon {
+/// Dot: red = recording, gray = paused, green = ready (B-11: the icon
+/// always mirrors the dictation state).
+fn tray_icon(recording: bool, paused: bool) -> tray_icon::Icon {
     const W: usize = 32;
     let mut rgba = vec![0u8; W * W * 4];
     let mut px = |x: i32, y: i32, r: u8, g: u8, b: u8, a: u8| {
@@ -144,8 +203,14 @@ fn tray_icon(recording: bool) -> tray_icon::Icon {
     }
     px(15, 24, 235, 235, 240, 255);
     px(16, 24, 235, 235, 240, 255);
-    // Status dot: red while recording, green when idle.
-    let (r, g) = if recording { (230, 60) } else { (80, 210) };
+    // Status dot: red while recording, gray while paused, green when idle.
+    let (r, g) = if recording {
+        (230, 60)
+    } else if paused {
+        (150, 150)
+    } else {
+        (80, 210)
+    };
     for y in 4..=8 {
         for x in 23..=27 {
             let dx = x - 25;
@@ -165,12 +230,15 @@ struct GuiApp {
     history_search: String,
     history_app_filter: String,
     tab: Tab,
+    /// First launch ever (B-01): welcome card + Settings tab by default.
+    first_run: bool,
     tray: Option<TrayIcon>,
     show_item: MenuItem,
     pause_item: MenuItem,
     quit_item: MenuItem,
     quit_requested: bool,
     icon_recording: bool,
+    icon_paused: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,6 +281,11 @@ impl GuiApp {
         if let Some(hk) = Hotkey::parse(&self.settings.hotkey) {
             win::set_hotkey_vk(hk.to_vk());
         }
+        win::set_edit_hotkey_vk(win::parse_edit_key(&self.settings.edit_key));
+        if let Err(e) = win::set_autostart(self.settings.autostart) {
+            self.state.push_log(format!("[gui] autostart failed: {e}"));
+        }
+        std::env::set_var("FLOWVOICE_PASTE_METHOD", &self.settings.paste_method);
         if let Ok(mut pref) = self.state.backend_pref.lock() {
             *pref = self.settings.backend;
         }
@@ -222,6 +295,11 @@ impl GuiApp {
         std::env::set_var(
             "FLOWVOICE_SOUND",
             if self.settings.sound { "1" } else { "0" },
+        );
+        #[cfg(feature = "audio")]
+        std::env::set_var(
+            "FLOWVOICE_NOISE_GATE",
+            if self.settings.noise_gate { "1" } else { "0" },
         );
     }
 
@@ -268,10 +346,15 @@ impl GuiApp {
             .state
             .recording
             .load(std::sync::atomic::Ordering::SeqCst);
-        if recording != self.icon_recording {
-            self.icon_recording = recording;
+        let paused = !win::is_enabled();
+        // Redraw on any state change (record/paused/ready all differ).
+        let key = (recording, paused);
+        let changed = key.0 != self.icon_recording || key.1 != self.icon_paused;
+        if changed {
+            self.icon_recording = key.0;
+            self.icon_paused = key.1;
             if let Some(tray) = &self.tray {
-                let _ = tray.set_icon(Some(tray_icon(recording)));
+                let _ = tray.set_icon(Some(tray_icon(recording, paused)));
             }
         }
     }
@@ -293,7 +376,25 @@ impl GuiApp {
                     .collect()
             })
             .unwrap_or_default();
-        let _ = write_json("history.json", &serde_json::Value::Array(entries));
+        // Encrypted store (M-17): DPAPI blob instead of plain JSON, and
+        // vice versa — only one store file exists at a time.
+        let saved = if self.settings.history_encrypt {
+            match win::dpapi_protect(serde_json::Value::Array(entries).to_string().as_bytes()) {
+                Ok(blob) => {
+                    let _ = std::fs::remove_file(app_dir().join("history.json"));
+                    std::fs::write(app_dir().join("history.enc"), &blob)
+                        .map_err(|e| format!("history save failed: {e}"))
+                }
+                Err(e) => Err(format!("history encrypt failed: {e}")),
+            }
+        } else {
+            let _ = std::fs::remove_file(app_dir().join("history.enc"));
+            write_json("history.json", &serde_json::Value::Array(entries))
+        };
+        if let Err(e) = saved {
+            self.state.push_log(format!("[gui] {e}"));
+            return;
+        }
         self.state
             .history_dirty
             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -354,6 +455,15 @@ impl GuiApp {
 
     fn show_status(&self, ui: &mut egui::Ui) {
         ui.heading("Статус");
+        if self.first_run {
+            ui.label(egui::RichText::new("Добро пожаловать! Три шага до диктовки:").strong());
+            ui.label(
+                "1. Держите хоткей (по умолчанию Right Ctrl) и говорите, отпустите для вставки.",
+            );
+            ui.label("2. Для облачного распознавания задайте GROQ_API_KEY, иначе работает локальный движок.");
+            ui.label("3. Проверьте звук и язык во вкладке «Настройки», затем диктуйте в любое поле ввода.");
+            ui.separator();
+        }
         let backend = self
             .state
             .backend_label
@@ -361,6 +471,15 @@ impl GuiApp {
             .map(|b| b.clone())
             .unwrap_or_default();
         ui.label(format!("бэкенд: {backend}"));
+        #[cfg(feature = "audio")]
+        {
+            // Live input level (C-07): follows the mic during recording.
+            let level = crate::audio::MIC_LEVEL.load(std::sync::atomic::Ordering::SeqCst);
+            ui.horizontal(|ui| {
+                ui.label("Микрофон:");
+                ui.add_sized([160.0, 18.0], egui::ProgressBar::new(level as f32 / 100.0));
+            });
+        }
         let last = self
             .state
             .last_text
@@ -399,6 +518,14 @@ impl GuiApp {
                 .show_ui(ui, |ui| {
                     for name in ["RCONTROL", "F7", "F8", "F9"] {
                         ui.selectable_value(&mut self.settings.hotkey, name.to_string(), name);
+                    }
+                });
+            ui.label("Правка:");
+            egui::ComboBox::from_id_salt("editkey")
+                .selected_text(self.settings.edit_key.clone())
+                .show_ui(ui, |ui| {
+                    for name in ["выкл", "RCONTROL", "F7", "F8", "F9"] {
+                        ui.selectable_value(&mut self.settings.edit_key, name.to_string(), name);
                     }
                 });
         });
@@ -444,6 +571,22 @@ impl GuiApp {
                     }
                 });
             ui.checkbox(&mut self.settings.sound, "Звуки");
+            #[cfg(feature = "audio")]
+            ui.checkbox(&mut self.settings.noise_gate, "Шумоподавление");
+            ui.checkbox(&mut self.settings.autostart, "Автозапуск");
+            ui.checkbox(&mut self.settings.history_encrypt, "Шифровать историю");
+            ui.label("Вставка:");
+            egui::ComboBox::from_id_salt("pastemethod")
+                .selected_text(self.settings.paste_method.clone())
+                .show_ui(ui, |ui| {
+                    for name in ["clipboard", "unicode"] {
+                        ui.selectable_value(
+                            &mut self.settings.paste_method,
+                            name.to_string(),
+                            name,
+                        );
+                    }
+                });
         });
         if ui.button("Сохранить и применить").clicked() {
             match save_settings(&self.settings) {
@@ -718,7 +861,7 @@ fn build_tray() -> (Option<TrayIcon>, MenuItem, MenuItem, MenuItem) {
         TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_tooltip("flowvoice — диктовка")
-            .with_icon(tray_icon(false))
+            .with_icon(tray_icon(false, false))
             .build()
             .ok()
     })();
@@ -740,29 +883,33 @@ pub fn run() {
         state::emit(&msg);
     }
 
-    // Restore persisted history.
-    if let Some(v) = read_json("history.json") {
-        if let Some(arr) = v.as_array() {
-            if let Ok(mut history) = state.history.lock() {
-                for item in arr.iter().take(100) {
-                    let secs = item.get("when").and_then(|w| w.as_u64()).unwrap_or(0);
-                    let text = item
-                        .get("text")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or_default();
-                    if text.is_empty() {
-                        continue;
-                    }
-                    history.push(crate::state::HistoryEntry {
-                        when: std::time::UNIX_EPOCH + Duration::from_secs(secs),
-                        text: text.to_string(),
-                        app: item
-                            .get("app")
-                            .and_then(|a| a.as_str())
-                            .unwrap_or_default()
-                            .to_string(),
-                    });
+    // Restore persisted history: encrypted store first, plain fallback.
+    let stored: Option<Vec<serde_json::Value>> = std::fs::read(app_dir().join("history.enc"))
+        .ok()
+        .and_then(|blob| win::dpapi_unprotect(&blob).ok())
+        .and_then(|plain| serde_json::from_slice(&plain).ok())
+        .and_then(|v: serde_json::Value| v.as_array().cloned())
+        .or_else(|| read_json("history.json").and_then(|v| v.as_array().cloned()));
+    if let Some(arr) = stored {
+        if let Ok(mut history) = state.history.lock() {
+            for item in arr.iter().take(100) {
+                let secs = item.get("when").and_then(|w| w.as_u64()).unwrap_or(0);
+                let text = item
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or_default();
+                if text.is_empty() {
+                    continue;
                 }
+                history.push(crate::state::HistoryEntry {
+                    when: std::time::UNIX_EPOCH + Duration::from_secs(secs),
+                    text: text.to_string(),
+                    app: item
+                        .get("app")
+                        .and_then(|a| a.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                });
             }
         }
     }
@@ -781,6 +928,21 @@ pub fn run() {
     }
 
     let hotkey = Hotkey::parse(&settings.hotkey).unwrap_or_default();
+    win::set_edit_hotkey_vk(win::parse_edit_key(&settings.edit_key));
+    if let Ok(k) = std::env::var("FLOWVOICE_EDIT_KEY") {
+        win::set_edit_hotkey_vk(win::parse_edit_key(&k));
+    }
+    if let Err(e) = win::set_autostart(settings.autostart) {
+        state.push_log(format!("[gui] autostart failed: {e}"));
+    }
+    std::env::set_var("FLOWVOICE_PASTE_METHOD", &settings.paste_method);
+    // First-run marker (B-01): welcome card + Settings tab on debut.
+    let seen = app_dir().join(".seen");
+    let first_run = !seen.exists();
+    if first_run {
+        let _ = std::fs::create_dir_all(app_dir());
+        let _ = std::fs::write(&seen, "1");
+    }
     win::spawn_pump(hotkey);
 
     #[cfg(feature = "audio")]
@@ -793,6 +955,11 @@ pub fn run() {
     std::env::set_var("FLOWVOICE_GROQ_MODEL", &settings.groq_model);
     std::env::set_var("FLOWVOICE_PROFILE", &settings.profile);
     std::env::set_var("FLOWVOICE_SOUND", if settings.sound { "1" } else { "0" });
+    #[cfg(feature = "audio")]
+    std::env::set_var(
+        "FLOWVOICE_NOISE_GATE",
+        if settings.noise_gate { "1" } else { "0" },
+    );
     if let Ok(mut pref) = state.backend_pref.lock() {
         *pref = settings.backend;
     }
@@ -807,6 +974,11 @@ pub fn run() {
         ..Default::default()
     };
     let app_state = state.clone();
+    let first_run_tab = if first_run {
+        Tab::Settings
+    } else {
+        Tab::Status
+    };
     if let Err(e) = eframe::run_native(
         "flowvoice",
         options,
@@ -821,13 +993,15 @@ pub fn run() {
                 status_line: String::new(),
                 history_search: String::new(),
                 history_app_filter: String::new(),
-                tab: Tab::Status,
+                tab: first_run_tab,
+                first_run,
                 tray,
                 show_item,
                 pause_item,
                 quit_item,
                 quit_requested: false,
                 icon_recording: false,
+                icon_paused: false,
             }) as Box<dyn eframe::App>)
         }),
     ) {
